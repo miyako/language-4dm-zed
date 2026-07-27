@@ -18,7 +18,7 @@ pub struct ChildGuard {
     shutdown_timeout: Duration,
 
     #[cfg(windows)]
-    job: windows_job::WindowsJob,
+    _job: windows_job::WindowsJob,
 }
 
 impl ChildGuard {
@@ -34,7 +34,7 @@ impl ChildGuard {
             shutdown_timeout,
 
             #[cfg(windows)]
-            job,
+            _job: job,
         })
     }
 
