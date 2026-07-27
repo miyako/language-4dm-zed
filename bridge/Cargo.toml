@@ -1,6 +1,6 @@
 [package]
 name = "tool4d-lsp-stdio"
-version = "0.2.8"
+version = "0.2.9"
 edition = "2024"
 publish = false
 
@@ -11,6 +11,7 @@ ctrlc = "3.5.2"
 wait-timeout = "0.2.1"
 libc = "0.2"
 signal-hook = "0.3"
+serde_json = "1"
 
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.61", features = [
