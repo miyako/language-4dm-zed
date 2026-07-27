@@ -1,4 +1,6 @@
-/target
-bridge/target/debug/*
-bridge/target/release/*
-grammars/fourd/
+/target/
+/bridge/target/
+/extension.wasm
+/grammars/
+/language_servers/
+.DS_Store
