@@ -1,0 +1,4 @@
+name = "4D"
+path_suffixes = ["4dm"]
+line_comments = ["// "]
+grammar = "fourd"

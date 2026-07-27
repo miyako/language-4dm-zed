@@ -1,0 +1,15 @@
+id = "fourd"
+name = "4D"
+version = "0.1.0"
+schema_version = 1
+authors = ["Keisuke Miyako <keisuke.miyako@4d.com>"]
+description = "4D language support powered by the tool4d language server"
+repository = "https://github.com/miyako/language-4dm-zed"
+
+[language_servers.tool4d]
+name = "tool4d"
+languages = ["4D"]
+
+[grammars.fourd]
+repository = "https://github.com/miyako/tree-sitter-fourd"
+rev = "8584dd655b37b62ad81bb43484d6fd23bee1f117"
