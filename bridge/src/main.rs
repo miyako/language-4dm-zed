@@ -1,5 +1,8 @@
 use std::{
+    cmp::Ordering as CmpOrdering,
+    env,
     ffi::OsStr,
+    fs,
     io::{self, BufRead, BufReader, Write},
     net::{Ipv4Addr, SocketAddr, TcpListener, TcpStream},
     path::{Path, PathBuf},
@@ -10,7 +13,7 @@ use std::{
         mpsc::RecvTimeoutError,
     },
     thread,
-    time::{Duration, Instant},
+    time::{Duration, Instant, SystemTime},
 };
 
 use anyhow::{Context, Result, bail};
@@ -37,8 +40,11 @@ enum BridgeCommand {
     /// Start tool4d and relay its TCP connection over stdin/stdout.
     Launch {
         /// Path to the tool4d executable.
+        ///
+        /// If omitted, the adapter searches PATH, 4D Analyzer's VS Code storage,
+        /// and conventional platform-specific locations.
         #[arg(long, env = "TOOL4D_PATH")]
-        tool: PathBuf,
+        tool: Option<PathBuf>,
 
         /// Explicit path to a .4DProject file.
         #[arg(long, env = "TOOL4D_PROJECT")]
@@ -160,7 +166,7 @@ fn run() -> Result<()> {
             dataless,
             log_level,
         } => launch(
-            &tool,
+            tool.as_deref(),
             project.as_deref(),
             workspace.as_deref(),
             port,
@@ -186,7 +192,7 @@ fn run() -> Result<()> {
 
 #[allow(clippy::too_many_arguments)]
 fn launch(
-    tool: &Path,
+    requested_tool: Option<&Path>,
     explicit_project: Option<&Path>,
     workspace: Option<&Path>,
     requested_port: Option<u16>,
@@ -196,8 +202,7 @@ fn launch(
     dataless: bool,
     log_level: Option<&str>,
 ) -> Result<()> {
-    validate_tool(tool)?;
-
+    let tool = resolve_tool(requested_tool)?;
     let project = resolve_project(explicit_project, workspace)?;
     let cancellation = install_signal_handlers()?;
 
@@ -212,7 +217,7 @@ fn launch(
 
     let port = listener_address.port();
 
-    let mut command = Command::new(tool);
+    let mut command = Command::new(&tool);
 
     command
         .arg(format!("--project={}", project.display()))
@@ -241,7 +246,7 @@ fn launch(
 
     eprintln!("tool4d-lsp-stdio: listening for tool4d on {listener_address}");
 
-    log_command(tool, command.get_args());
+    log_command(&tool, command.get_args());
 
     let mut child = command
         .spawn()
@@ -627,6 +632,437 @@ fn log_command<'a>(executable: &Path, arguments: impl Iterator<Item = &'a OsStr>
     );
 }
 
+#[derive(Debug)]
+struct ToolCandidate {
+    path: PathBuf,
+    version: (u64, u64),
+    build: u64,
+    modified: SystemTime,
+}
+
+fn resolve_tool(requested_tool: Option<&Path>) -> Result<PathBuf> {
+    if let Some(tool) = requested_tool {
+        let tool = canonicalize_tool(tool)?;
+
+        eprintln!(
+            "tool4d-lsp-stdio: using configured tool4d at {}",
+            tool.display()
+        );
+
+        return Ok(tool);
+    }
+
+    if let Some(tool) = find_tool_on_path() {
+        let tool = canonicalize_tool(&tool)?;
+
+        eprintln!(
+            "tool4d-lsp-stdio: using tool4d from PATH at {}",
+            tool.display()
+        );
+
+        return Ok(tool);
+    }
+
+    if let Some(tool) = discover_vscode_analyzer_tool()? {
+        let tool = canonicalize_tool(&tool)?;
+
+        eprintln!(
+            "tool4d-lsp-stdio: using 4D Analyzer tool4d at {}",
+            tool.display()
+        );
+
+        return Ok(tool);
+    }
+
+    if let Some(tool) = discover_conventional_tool()? {
+        let tool = canonicalize_tool(&tool)?;
+
+        eprintln!(
+            "tool4d-lsp-stdio: using installed tool4d at {}",
+            tool.display()
+        );
+
+        return Ok(tool);
+    }
+
+    bail!(
+        "could not find tool4d\n\
+         \n\
+         Searched:\n\
+         - --tool\n\
+         - TOOL4D_PATH\n\
+         - the process PATH\n\
+         - 4D Analyzer's VS Code global storage\n\
+         - conventional platform-specific application locations\n\
+         \n\
+         Configure it explicitly with:\n\
+         \n\
+         tool4d-lsp-stdio launch --tool /path/to/tool4d ...\n\
+         \n\
+         or set TOOL4D_PATH"
+    )
+}
+
+fn canonicalize_tool(tool: &Path) -> Result<PathBuf> {
+    validate_tool(tool)?;
+
+    tool.canonicalize()
+        .with_context(|| format!("failed to resolve {}", tool.display()))
+}
+
+fn find_tool_on_path() -> Option<PathBuf> {
+    let path = env::var_os("PATH")?;
+
+    for directory in env::split_paths(&path) {
+        for executable_name in tool_executable_names() {
+            let candidate = directory.join(executable_name);
+
+            if is_valid_tool_candidate(&candidate) {
+                return Some(candidate);
+            }
+        }
+    }
+
+    None
+}
+
+fn tool_executable_names() -> &'static [&'static str] {
+    #[cfg(windows)]
+    {
+        &["tool4d.exe"]
+    }
+
+    #[cfg(not(windows))]
+    {
+        &["tool4d"]
+    }
+}
+
+fn discover_vscode_analyzer_tool() -> Result<Option<PathBuf>> {
+    let mut roots = Vec::new();
+
+    #[cfg(target_os = "macos")]
+    {
+        if let Some(home) = home_directory() {
+            let application_support = home.join("Library").join("Application Support");
+
+            roots.push(
+                application_support
+                    .join("Code")
+                    .join("User")
+                    .join("globalStorage")
+                    .join("4d.4d-analyzer")
+                    .join("tool4d"),
+            );
+
+            roots.push(
+                application_support
+                    .join("Code - Insiders")
+                    .join("User")
+                    .join("globalStorage")
+                    .join("4d.4d-analyzer")
+                    .join("tool4d"),
+            );
+
+            roots.push(
+                application_support
+                    .join("VSCodium")
+                    .join("User")
+                    .join("globalStorage")
+                    .join("4d.4d-analyzer")
+                    .join("tool4d"),
+            );
+        }
+    }
+
+    #[cfg(windows)]
+    {
+        if let Some(app_data) = env::var_os("APPDATA") {
+            let app_data = PathBuf::from(app_data);
+
+            roots.push(
+                app_data
+                    .join("Code")
+                    .join("User")
+                    .join("globalStorage")
+                    .join("4d.4d-analyzer")
+                    .join("tool4d"),
+            );
+
+            roots.push(
+                app_data
+                    .join("Code - Insiders")
+                    .join("User")
+                    .join("globalStorage")
+                    .join("4d.4d-analyzer")
+                    .join("tool4d"),
+            );
+
+            roots.push(
+                app_data
+                    .join("VSCodium")
+                    .join("User")
+                    .join("globalStorage")
+                    .join("4d.4d-analyzer")
+                    .join("tool4d"),
+            );
+        }
+    }
+
+    let mut candidates = Vec::new();
+
+    for root in roots {
+        collect_analyzer_candidates(&root, &root, 0, &mut candidates)?;
+    }
+
+    candidates.sort_by(compare_tool_candidates);
+
+    Ok(candidates.pop().map(|candidate| candidate.path))
+}
+
+fn collect_analyzer_candidates(
+    root: &Path,
+    directory: &Path,
+    depth: usize,
+    candidates: &mut Vec<ToolCandidate>,
+) -> Result<()> {
+    const MAX_DEPTH: usize = 8;
+    const MAX_CANDIDATES: usize = 100;
+
+    if depth > MAX_DEPTH || !directory.is_dir() {
+        return Ok(());
+    }
+
+    let entries = match fs::read_dir(directory) {
+        Ok(entries) => entries,
+
+        Err(error)
+            if matches!(
+                error.kind(),
+                io::ErrorKind::NotFound | io::ErrorKind::PermissionDenied
+            ) =>
+        {
+            return Ok(());
+        }
+
+        Err(error) => {
+            return Err(error).with_context(|| format!("failed to search {}", directory.display()));
+        }
+    };
+
+    for entry in entries {
+        let entry =
+            entry.with_context(|| format!("failed to read an entry in {}", directory.display()))?;
+
+        let path = entry.path();
+        let file_type = entry
+            .file_type()
+            .with_context(|| format!("failed to inspect {}", path.display()))?;
+
+        if file_type.is_symlink() {
+            continue;
+        }
+
+        if file_type.is_dir() {
+            collect_analyzer_candidates(root, &path, depth + 1, candidates)?;
+
+            continue;
+        }
+
+        if !file_type.is_file() || !is_tool_executable_name(&path) {
+            continue;
+        }
+
+        if !is_valid_tool_candidate(&path) {
+            continue;
+        }
+
+        let (version, build) = analyzer_version_and_build(root, &path);
+
+        let modified = path
+            .metadata()
+            .and_then(|metadata| metadata.modified())
+            .unwrap_or(SystemTime::UNIX_EPOCH);
+
+        candidates.push(ToolCandidate {
+            path,
+            version,
+            build,
+            modified,
+        });
+
+        if candidates.len() > MAX_CANDIDATES {
+            bail!(
+                "more than {MAX_CANDIDATES} tool4d executables were found \
+                 under {}",
+                root.display()
+            );
+        }
+    }
+
+    Ok(())
+}
+
+fn analyzer_version_and_build(root: &Path, executable: &Path) -> ((u64, u64), u64) {
+    let relative = match executable.strip_prefix(root) {
+        Ok(relative) => relative,
+        Err(_) => return ((0, 0), 0),
+    };
+
+    let components = relative
+        .components()
+        .filter_map(|component| component.as_os_str().to_str())
+        .collect::<Vec<_>>();
+
+    let version = components
+        .first()
+        .and_then(|value| parse_4d_version(value))
+        .unwrap_or((0, 0));
+
+    let build = components
+        .get(1)
+        .and_then(|value| value.parse::<u64>().ok())
+        .unwrap_or(0);
+
+    (version, build)
+}
+
+fn parse_4d_version(value: &str) -> Option<(u64, u64)> {
+    let uppercase = value.to_ascii_uppercase();
+
+    if let Some((major, release)) = uppercase.split_once('R') {
+        return Some((major.parse::<u64>().ok()?, release.parse::<u64>().ok()?));
+    }
+
+    Some((uppercase.parse::<u64>().ok()?, 0))
+}
+
+fn compare_tool_candidates(left: &ToolCandidate, right: &ToolCandidate) -> CmpOrdering {
+    left.version
+        .cmp(&right.version)
+        .then_with(|| left.build.cmp(&right.build))
+        .then_with(|| left.modified.cmp(&right.modified))
+        .then_with(|| left.path.cmp(&right.path))
+}
+
+fn is_tool_executable_name(path: &Path) -> bool {
+    let Some(name) = path.file_name().and_then(OsStr::to_str) else {
+        return false;
+    };
+
+    tool_executable_names()
+        .iter()
+        .any(|expected| name.eq_ignore_ascii_case(expected))
+}
+
+fn is_valid_tool_candidate(path: &Path) -> bool {
+    if !path.is_file() {
+        return false;
+    }
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+
+        path.metadata()
+            .map(|metadata| metadata.permissions().mode() & 0o111 != 0)
+            .unwrap_or(false)
+    }
+
+    #[cfg(not(unix))]
+    {
+        true
+    }
+}
+
+fn discover_conventional_tool() -> Result<Option<PathBuf>> {
+    #[cfg(target_os = "macos")]
+    {
+        let mut application_directories = vec![PathBuf::from("/Applications")];
+
+        if let Some(home) = home_directory() {
+            application_directories.push(home.join("Applications"));
+        }
+
+        let mut candidates = Vec::new();
+
+        for applications in application_directories {
+            collect_macos_application_candidates(&applications, &mut candidates)?;
+        }
+
+        candidates.sort_by(|left, right| {
+            left.file_name()
+                .cmp(&right.file_name())
+                .then_with(|| left.cmp(right))
+        });
+
+        Ok(candidates.pop())
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    {
+        Ok(None)
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn collect_macos_application_candidates(
+    applications: &Path,
+    candidates: &mut Vec<PathBuf>,
+) -> Result<()> {
+    if !applications.is_dir() {
+        return Ok(());
+    }
+
+    let entries = match fs::read_dir(applications) {
+        Ok(entries) => entries,
+
+        Err(error) if error.kind() == io::ErrorKind::PermissionDenied => {
+            return Ok(());
+        }
+
+        Err(error) => {
+            return Err(error)
+                .with_context(|| format!("failed to search {}", applications.display()));
+        }
+    };
+
+    for entry in entries {
+        let entry = entry?;
+        let name = entry.file_name();
+        let name = name.to_string_lossy();
+
+        if !name.starts_with("4D") || !entry.path().is_dir() {
+            continue;
+        }
+
+        let candidate = entry
+            .path()
+            .join("tool4d.app")
+            .join("Contents")
+            .join("MacOS")
+            .join("tool4d");
+
+        if is_valid_tool_candidate(&candidate) {
+            candidates.push(candidate);
+        }
+    }
+
+    Ok(())
+}
+
+fn home_directory() -> Option<PathBuf> {
+    #[cfg(windows)]
+    {
+        env::var_os("USERPROFILE").map(PathBuf::from)
+    }
+
+    #[cfg(not(windows))]
+    {
+        env::var_os("HOME").map(PathBuf::from)
+    }
+}
+
 fn validate_tool(tool: &Path) -> Result<()> {
     if !tool.exists() {
         bail!("tool4d does not exist: {}", tool.display());
@@ -656,7 +1092,15 @@ fn validate_tool(tool: &Path) -> Result<()> {
 
 fn resolve_project(explicit_project: Option<&Path>, workspace: Option<&Path>) -> Result<PathBuf> {
     if let Some(project) = explicit_project {
-        return validate_project(project);
+        let project = if project.is_absolute() {
+            project.to_path_buf()
+        } else {
+            let workspace = workspace.context("a relative --project path requires --workspace")?;
+
+            workspace.join(project)
+        };
+
+        return validate_project(&project);
     }
 
     let workspace =
