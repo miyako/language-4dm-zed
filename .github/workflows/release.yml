@@ -1,0 +1,171 @@
+name: Release
+
+on:
+  push:
+	tags:
+	  - "v*"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  macos:
+	name: Build, sign, and notarize macOS adapter
+	runs-on: macos-latest
+	environment: release
+
+	steps:
+	  - name: Check out repository
+		uses: actions/checkout@v4
+
+	  - name: Install Rust
+		uses: dtolnay/rust-toolchain@stable
+
+	  - name: Build adapter
+		run: |
+		  cargo build \
+			--manifest-path bridge/Cargo.toml \
+			--locked \
+			--release
+
+	  - name: Import Apple signing certificate
+		env:
+		  P12_BASE64: ${{ secrets.APPLE_DEVELOPER_ID_P12_BASE64 }}
+		  P12_PASSWORD: ${{ secrets.APPLE_DEVELOPER_ID_P12_PASSWORD }}
+		  KEYCHAIN_PASSWORD: ${{ secrets.MACOS_KEYCHAIN_PASSWORD }}
+		shell: bash
+		run: |
+		  set -euo pipefail
+
+		  CERTIFICATE_PATH="$RUNNER_TEMP/developer-id.p12"
+		  KEYCHAIN_PATH="$RUNNER_TEMP/build.keychain-db"
+
+		  printf '%s' "$P12_BASE64" |
+			base64 --decode > "$CERTIFICATE_PATH"
+
+		  security create-keychain \
+			-p "$KEYCHAIN_PASSWORD" \
+			"$KEYCHAIN_PATH"
+
+		  security set-keychain-settings \
+			-lut 21600 \
+			"$KEYCHAIN_PATH"
+
+		  security unlock-keychain \
+			-p "$KEYCHAIN_PASSWORD" \
+			"$KEYCHAIN_PATH"
+
+		  security import "$CERTIFICATE_PATH" \
+			-P "$P12_PASSWORD" \
+			-A \
+			-t cert \
+			-f pkcs12 \
+			-k "$KEYCHAIN_PATH"
+
+		  security set-key-partition-list \
+			-S apple-tool:,apple: \
+			-s \
+			-k "$KEYCHAIN_PASSWORD" \
+			"$KEYCHAIN_PATH"
+
+		  security list-keychains \
+			-d user \
+			-s "$KEYCHAIN_PATH"
+
+	  - name: Sign adapter
+		env:
+		  SIGNING_IDENTITY: ${{ secrets.APPLE_CODESIGN_IDENTITY }}
+		shell: bash
+		run: |
+		  set -euo pipefail
+
+		  BINARY="bridge/target/release/tool4d-lsp-stdio"
+
+		  codesign \
+			--force \
+			--options runtime \
+			--timestamp \
+			--sign "$SIGNING_IDENTITY" \
+			"$BINARY"
+
+		  codesign \
+			--verify \
+			--strict \
+			--verbose=2 \
+			"$BINARY"
+
+	  - name: Package adapter
+		shell: bash
+		run: |
+		  set -euo pipefail
+
+		  PACKAGE_DIR="$RUNNER_TEMP/tool4d-lsp-stdio"
+
+		  mkdir -p "$PACKAGE_DIR"
+
+		  cp \
+			bridge/target/release/tool4d-lsp-stdio \
+			"$PACKAGE_DIR/tool4d-lsp-stdio"
+
+		  cp README.md "$PACKAGE_DIR/README.md"
+		  cp LICENSE "$PACKAGE_DIR/LICENSE"
+
+		  ditto \
+			-c \
+			-k \
+			--keepParent \
+			"$PACKAGE_DIR" \
+			tool4d-lsp-stdio-aarch64-apple-darwin.zip
+
+	  - name: Prepare notarization key
+		env:
+		  API_PRIVATE_KEY: ${{ secrets.APPLE_API_PRIVATE_KEY }}
+		  API_KEY_ID: ${{ secrets.APPLE_API_KEY_ID }}
+		shell: bash
+		run: |
+		  set -euo pipefail
+
+		  API_KEY_PATH="$RUNNER_TEMP/AuthKey_${API_KEY_ID}.p8"
+		  printf '%s' "$API_PRIVATE_KEY" > "$API_KEY_PATH"
+
+		  echo "APPLE_API_KEY_PATH=$API_KEY_PATH" >> "$GITHUB_ENV"
+
+	  - name: Notarize adapter
+		env:
+		  API_KEY_ID: ${{ secrets.APPLE_API_KEY_ID }}
+		  API_ISSUER_ID: ${{ secrets.APPLE_API_ISSUER_ID }}
+		shell: bash
+		run: |
+		  set -euo pipefail
+
+		  xcrun notarytool submit \
+			tool4d-lsp-stdio-aarch64-apple-darwin.zip \
+			--key "$APPLE_API_KEY_PATH" \
+			--key-id "$API_KEY_ID" \
+			--issuer "$API_ISSUER_ID" \
+			--wait
+
+	  - name: Create checksum
+		run: |
+		  shasum -a 256 \
+			tool4d-lsp-stdio-aarch64-apple-darwin.zip \
+			> tool4d-lsp-stdio-aarch64-apple-darwin.zip.sha256
+
+	  - name: Upload workflow artifacts
+		uses: actions/upload-artifact@v4
+		with:
+		  name: tool4d-lsp-stdio-macos
+		  path: |
+			tool4d-lsp-stdio-aarch64-apple-darwin.zip
+			tool4d-lsp-stdio-aarch64-apple-darwin.zip.sha256
+
+	  - name: Publish GitHub release assets
+		env:
+		  GH_TOKEN: ${{ github.token }}
+		run: |
+		  gh release upload \
+			"${GITHUB_REF_NAME}" \
+			tool4d-lsp-stdio-aarch64-apple-darwin.zip \
+			tool4d-lsp-stdio-aarch64-apple-darwin.zip.sha256 \
+			--clobber
