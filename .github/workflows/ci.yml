@@ -2,8 +2,8 @@ name: CI
 
 on:
   push:
-	branches:
-	  - main
+    branches:
+      - main
   pull_request:
   workflow_dispatch:
 
@@ -12,72 +12,89 @@ permissions:
 
 jobs:
   extension:
-	name: Zed extension
-	runs-on: macos-latest
+    name: Zed extension
+    runs-on: macos-latest
 
-	steps:
-	  - name: Check out repository
-		uses: actions/checkout@v4
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
 
-	  - name: Install Rust
-		uses: dtolnay/rust-toolchain@stable
-		with:
-		  targets: wasm32-wasip1
-		  components: rustfmt, clippy
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-wasip1
+          components: rustfmt, clippy
 
-	  - name: Restore Rust cache
-		uses: Swatinem/rust-cache@v2
-		with:
-		  workspaces: . -> target
+      - name: Restore Rust cache
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: . -> target
 
-	  - name: Check formatting
-		run: cargo fmt --check
+      - name: Check formatting
+        run: cargo fmt --check
 
-	  - name: Check extension
-		run: cargo check --locked
+      - name: Check extension
+        run: cargo check --locked
 
-	  - name: Run Clippy
-		run: cargo clippy --locked --all-targets -- -D warnings
+      - name: Run Clippy
+        run: cargo clippy --locked --all-targets -- -D warnings
 
-	  - name: Build WebAssembly extension
-		run: cargo build --locked --release --target wasm32-wasip1
+      - name: Build WebAssembly extension
+        run: cargo build --locked --release --target wasm32-wasip1
 
   bridge:
-	name: Native adapter
-	strategy:
-	  fail-fast: false
-	  matrix:
-		os:
-		  - macos-latest
-		  - windows-latest
+    name: Native adapter (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os:
+          - macos-latest
+          - windows-latest
 
-	runs-on: ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
 
-	steps:
-	  - name: Check out repository
-		uses: actions/checkout@v4
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
 
-	  - name: Install Rust
-		uses: dtolnay/rust-toolchain@stable
-		with:
-		  components: rustfmt, clippy
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
 
-	  - name: Restore Rust cache
-		uses: Swatinem/rust-cache@v2
-		with:
-		  workspaces: bridge -> bridge/target
+      - name: Restore Rust cache
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: bridge -> bridge/target
 
-	  - name: Check formatting
-		run: cargo fmt --manifest-path bridge/Cargo.toml --check
+      - name: Check formatting
+        run: cargo fmt --manifest-path bridge/Cargo.toml --check
 
-	  - name: Check adapter
-		run: cargo check --manifest-path bridge/Cargo.toml --locked --all-targets
+      - name: Check adapter
+        run: >
+          cargo check
+          --manifest-path bridge/Cargo.toml
+          --locked
+          --all-targets
 
-	  - name: Run Clippy
-		run: cargo clippy --manifest-path bridge/Cargo.toml --locked --all-targets -- -D warnings
+      - name: Run Clippy
+        run: >
+          cargo clippy
+          --manifest-path bridge/Cargo.toml
+          --locked
+          --all-targets
+          --
+          -D warnings
 
-	  - name: Run tests
-		run: cargo test --manifest-path bridge/Cargo.toml --locked
+      - name: Run tests
+        run: >
+          cargo test
+          --manifest-path bridge/Cargo.toml
+          --locked
 
-	  - name: Build release adapter
-		run: cargo build --manifest-path bridge/Cargo.toml --locked --release
+      - name: Build release adapter
+        run: >
+          cargo build
+          --manifest-path bridge/Cargo.toml
+          --locked
+          --release
