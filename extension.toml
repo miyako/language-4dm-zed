@@ -1,6 +1,6 @@
 id = "fourd"
 name = "4D"
-version = "0.1.0"
+version = "0.1.1"
 schema_version = 1
 authors = ["Keisuke Miyako <keisuke.miyako@4d.com>"]
 description = "4D language support powered by the tool4d language server"
