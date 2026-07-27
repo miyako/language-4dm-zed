@@ -272,7 +272,7 @@ dependencies = [
 
 [[package]]
 name = "tool4d-lsp-stdio"
-version = "0.2.0"
+version = "0.2.4"
 dependencies = [
  "anyhow",
  "clap",
