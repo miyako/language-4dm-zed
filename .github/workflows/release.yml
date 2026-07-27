@@ -155,18 +155,34 @@ jobs:
 
       - name: Notarize adapter
         env:
-          API_KEY_ID: ${{ secrets.APPLE_API_KEY_ID }}
-          API_ISSUER_ID: ${{ secrets.APPLE_API_ISSUER_ID }}
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_APP_SPECIFIC_PASSWORD: ${{ secrets.APPLE_APP_SPECIFIC_PASSWORD }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
         shell: bash
         run: |
           set -euo pipefail
-
+          
+          if [[ -z "${APPLE_ID:-}" ]]; then
+            echo "APPLE_ID is not configured"
+            exit 1
+          fi
+          
+          if [[ -z "${APPLE_APP_SPECIFIC_PASSWORD:-}" ]]; then
+            echo "APPLE_APP_SPECIFIC_PASSWORD is not configured"
+            exit 1
+          fi
+          
+          if [[ -z "${APPLE_TEAM_ID:-}" ]]; then
+            echo "APPLE_TEAM_ID is not configured"
+            exit 1
+          fi
+          
           xcrun notarytool submit \
-            tool4d-lsp-stdio-aarch64-apple-darwin.zip \
-            --key "$APPLE_API_KEY_PATH" \
-            --key-id "$API_KEY_ID" \
-            --issuer "$API_ISSUER_ID" \
-            --wait
+          tool4d-lsp-stdio-aarch64-apple-darwin.zip \
+          --apple-id "$APPLE_ID" \
+          --password "$APPLE_APP_SPECIFIC_PASSWORD" \
+          --team-id "$APPLE_TEAM_ID" \
+          --wait
 
       - name: Create checksum
         shell: bash
