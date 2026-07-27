@@ -1,15 +1,25 @@
 use std::{
-    io,
+    ffi::OsStr,
+    io::{self, BufRead, BufReader, Write},
     net::{Ipv4Addr, SocketAddr, TcpListener, TcpStream},
     path::{Path, PathBuf},
-    process::{Child, Command, ExitCode, Stdio},
+    process::{Child, ChildStdout, Command, ExitCode, ExitStatus, Stdio},
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+        mpsc::RecvTimeoutError,
+    },
     thread,
     time::{Duration, Instant},
 };
 
 use anyhow::{Context, Result, bail};
-use clap::{Parser, Subcommand};
-use tool4d_lsp_stdio::relay;
+use clap::{ArgAction, Parser, Subcommand};
+use tool4d_lsp_stdio::relay::{Relay, RelayEvent};
+use wait_timeout::ChildExt;
+
+#[cfg(unix)]
+use std::os::unix::process::CommandExt;
 
 #[derive(Debug, Parser)]
 #[command(
@@ -38,26 +48,89 @@ enum BridgeCommand {
         #[arg(long)]
         workspace: Option<PathBuf>,
 
-        /// Local TCP port on which to listen for tool4d.
+        /// Local TCP port on which the adapter listens for tool4d.
         ///
-        /// If omitted, the operating system chooses an available port.
+        /// If omitted, the operating system selects an available port.
         #[arg(long, env = "TOOL4D_LSP_PORT")]
         port: Option<u16>,
 
         /// Number of seconds to wait for tool4d to connect.
-        #[arg(long, default_value_t = 30)]
+        #[arg(long, env = "TOOL4D_STARTUP_TIMEOUT", default_value_t = 30)]
         startup_timeout: u64,
+
+        /// Number of seconds to wait before force-killing tool4d.
+        #[arg(long, env = "TOOL4D_SHUTDOWN_TIMEOUT", default_value_t = 5)]
+        shutdown_timeout: u64,
+
+        /// Prevent execution of project startup database methods.
+        ///
+        /// Enabled by default. Override with
+        /// TOOL4D_SKIP_ONSTARTUP=false or --skip-onstartup=false.
+        #[arg(
+            long,
+            env = "TOOL4D_SKIP_ONSTARTUP",
+            default_value_t = true,
+            action = ArgAction::Set
+        )]
+        skip_onstartup: bool,
+
+        /// Open the project without a data file.
+        ///
+        /// Enabled by default. Override with TOOL4D_DATALESS=false or
+        /// --dataless=false.
+        #[arg(
+            long,
+            env = "TOOL4D_DATALESS",
+            default_value_t = true,
+            action = ArgAction::Set
+        )]
+        dataless: bool,
+
+        /// Diagnostic log level passed to tool4d.
+        #[arg(long, env = "TOOL4D_LOG_LEVEL")]
+        log_level: Option<String>,
     },
 
     /// Connect stdin/stdout to an already-listening TCP service.
     ///
-    /// This generic mode is not used when launching tool4d, because tool4d is
-    /// itself a TCP client.
+    /// This mode is generic and is not used by the tool4d launcher.
     Connect {
         /// Address of the existing TCP service.
         #[arg(long)]
         address: SocketAddr,
     },
+}
+
+/// Owns the tool4d process and terminates it when dropped.
+///
+/// This provides cleanup during normal returns, propagated errors, and Rust
+/// panics when panic unwinding is enabled.
+struct ChildGuard {
+    child: Child,
+    shutdown_timeout: Duration,
+}
+
+impl ChildGuard {
+    fn new(child: Child, shutdown_timeout: Duration) -> Self {
+        Self {
+            child,
+            shutdown_timeout,
+        }
+    }
+
+    fn try_wait(&mut self) -> io::Result<Option<ExitStatus>> {
+        self.child.try_wait()
+    }
+
+    fn terminate(&mut self) {
+        terminate_child(&mut self.child, self.shutdown_timeout);
+    }
+}
+
+impl Drop for ChildGuard {
+    fn drop(&mut self) {
+        self.terminate();
+    }
 }
 
 fn main() -> ExitCode {
@@ -82,37 +155,55 @@ fn run() -> Result<()> {
             workspace,
             port,
             startup_timeout,
+            shutdown_timeout,
+            skip_onstartup,
+            dataless,
+            log_level,
         } => launch(
             &tool,
             project.as_deref(),
             workspace.as_deref(),
             port,
             Duration::from_secs(startup_timeout),
+            Duration::from_secs(shutdown_timeout),
+            skip_onstartup,
+            dataless,
+            log_level.as_deref(),
         ),
 
         BridgeCommand::Connect { address } => {
+            let cancellation = install_signal_handlers()?;
+
             let stream = TcpStream::connect(address)
                 .with_context(|| format!("failed to connect to {address}"))?;
 
-            relay::stdio_to_tcp(stream).context("the TCP stream relay failed")
+            let relay = Relay::start(stream).context("failed to start the TCP stream relay")?;
+
+            supervise_relay(relay, None, &cancellation)
         }
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn launch(
     tool: &Path,
     explicit_project: Option<&Path>,
     workspace: Option<&Path>,
     requested_port: Option<u16>,
     startup_timeout: Duration,
+    shutdown_timeout: Duration,
+    skip_onstartup: bool,
+    dataless: bool,
+    log_level: Option<&str>,
 ) -> Result<()> {
     validate_tool(tool)?;
 
     let project = resolve_project(explicit_project, workspace)?;
+    let cancellation = install_signal_handlers()?;
 
     /*
-     * tool4d is the TCP client. The bridge must therefore bind and retain the
-     * listening socket before launching tool4d.
+     * tool4d is the TCP client. Keep the listener bound while tool4d starts.
+     * Binding port zero atomically selects and reserves an available port.
      */
     let listener = create_listener(requested_port)?;
     let listener_address = listener
@@ -121,45 +212,55 @@ fn launch(
 
     let port = listener_address.port();
 
-    let project_argument = format!("--project={}", project.display());
-    let lsp_argument = format!("--lsp={port}");
+    let mut command = Command::new(tool);
+
+    command
+        .arg(format!("--project={}", project.display()))
+        .arg(format!("--lsp={port}"))
+        .stdin(Stdio::null())
+        /*
+         * Child stdout must never be inherited because adapter stdout is the
+         * LSP protocol channel.
+         */
+        .stdout(Stdio::piped())
+        .stderr(Stdio::inherit());
+
+    if skip_onstartup {
+        command.arg("--skip-onstartup");
+    }
+
+    if dataless {
+        command.arg("--dataless");
+    }
+
+    if let Some(log_level) = log_level {
+        command.arg(format!("--log-level={log_level}"));
+    }
+
+    configure_process_group(&mut command);
 
     eprintln!("tool4d-lsp-stdio: listening for tool4d on {listener_address}");
 
-    eprintln!(
-        "tool4d-lsp-stdio: executing {} {:?} {:?}",
-        tool.display(),
-        project_argument,
-        lsp_argument
-    );
+    log_command(tool, command.get_args());
 
-    let mut child = Command::new(tool)
-        .arg(&project_argument)
-        .arg(&lsp_argument)
-        .stdin(Stdio::null())
-        /*
-         * Adapter stdout belongs to Zed's LSP transport. Never allow child
-         * process output to enter it.
-         */
-        .stdout(Stdio::null())
-        .stderr(Stdio::inherit())
+    let mut child = command
         .spawn()
         .with_context(|| format!("failed to start {}", tool.display()))?;
 
-    let result = match accept_with_timeout(&listener, &mut child, startup_timeout) {
-        Ok(stream) => {
-            // Only one connection is needed.
-            drop(listener);
+    if let Some(stdout) = child.stdout.take() {
+        forward_tool4d_stdout(stdout);
+    }
 
-            relay::stdio_to_tcp(stream).context("the LSP stream relay failed")
-        }
+    let mut child = ChildGuard::new(child, shutdown_timeout);
 
-        Err(error) => Err(error),
-    };
+    let stream = accept_with_timeout(&listener, &mut child, startup_timeout, &cancellation)?;
 
-    stop_child(&mut child);
+    // Only one tool4d connection is expected.
+    drop(listener);
 
-    result
+    let relay = Relay::start(stream).context("failed to start the LSP stream relay")?;
+
+    supervise_relay(relay, Some(&mut child), &cancellation)
 }
 
 fn create_listener(requested_port: Option<u16>) -> Result<TcpListener> {
@@ -169,7 +270,10 @@ fn create_listener(requested_port: Option<u16>) -> Result<TcpListener> {
         if port == 0 {
             "failed to bind a local TCP listener".to_owned()
         } else {
-            format!("failed to bind local TCP port {port}")
+            format!(
+                "failed to bind local TCP port {port}; \
+                     the port may already be in use"
+            )
         }
     })?;
 
@@ -182,21 +286,31 @@ fn create_listener(requested_port: Option<u16>) -> Result<TcpListener> {
 
 fn accept_with_timeout(
     listener: &TcpListener,
-    child: &mut Child,
+    child: &mut ChildGuard,
     timeout: Duration,
+    cancellation: &AtomicBool,
 ) -> Result<TcpStream> {
     let started = Instant::now();
 
     loop {
+        if cancellation.load(Ordering::SeqCst) {
+            bail!("termination requested while waiting for tool4d");
+        }
+
         match listener.accept() {
             Ok((stream, peer_address)) => {
                 if !peer_address.ip().is_loopback() {
-                    bail!("rejected a non-loopback connection from {peer_address}");
+                    eprintln!(
+                        "tool4d-lsp-stdio: rejected non-loopback \
+                         connection from {peer_address}"
+                    );
+                    continue;
                 }
 
-                // The listener is nonblocking so that we can monitor the child process
-                // and enforce a startup timeout. The established LSP stream must be
-                // switched back to blocking mode before io::copy is used.
+                /*
+                 * Accepted streams inherit the listener's nonblocking status
+                 * on some platforms. The relay uses blocking I/O.
+                 */
                 stream
                     .set_nonblocking(false)
                     .context("failed to make the tool4d connection blocking")?;
@@ -205,7 +319,10 @@ fn accept_with_timeout(
                     .set_nodelay(true)
                     .context("failed to configure the tool4d connection")?;
 
-                eprintln!("tool4d-lsp-stdio: tool4d connected from {peer_address}");
+                eprintln!(
+                    "tool4d-lsp-stdio: tool4d connected from \
+                     {peer_address}"
+                );
 
                 return Ok(stream);
             }
@@ -235,6 +352,281 @@ fn accept_with_timeout(
     }
 }
 
+fn supervise_relay(
+    relay: Relay,
+    mut child: Option<&mut ChildGuard>,
+    cancellation: &AtomicBool,
+) -> Result<()> {
+    const SUPERVISOR_INTERVAL: Duration = Duration::from_millis(100);
+
+    loop {
+        if cancellation.load(Ordering::SeqCst) {
+            eprintln!(
+                "tool4d-lsp-stdio: termination requested; \
+                 stopping the LSP session"
+            );
+
+            relay.shutdown();
+            return Ok(());
+        }
+
+        if let Some(child_guard) = child.as_deref_mut()
+            && let Some(status) = child_guard
+                .try_wait()
+                .context("failed to inspect the tool4d process")?
+        {
+            relay.shutdown();
+
+            if status.success() {
+                return Ok(());
+            }
+
+            bail!("tool4d exited unexpectedly: {status}");
+        }
+
+        match relay.events().recv_timeout(SUPERVISOR_INTERVAL) {
+            Ok(RelayEvent::StdinClosed) => {
+                /*
+                 * Zed has closed the adapter's input. Do not wait
+                 * indefinitely for tool4d to close the TCP connection.
+                 */
+                eprintln!(
+                    "tool4d-lsp-stdio: editor input closed; \
+                     stopping tool4d"
+                );
+
+                relay.shutdown();
+                return Ok(());
+            }
+
+            Ok(RelayEvent::SocketClosed) => {
+                relay.shutdown();
+                return Ok(());
+            }
+
+            Ok(RelayEvent::Error { direction, error }) => {
+                relay.shutdown();
+
+                if matches!(
+                    error.kind(),
+                    io::ErrorKind::BrokenPipe
+                        | io::ErrorKind::ConnectionReset
+                        | io::ErrorKind::UnexpectedEof
+                        | io::ErrorKind::NotConnected
+                ) {
+                    eprintln!(
+                        "tool4d-lsp-stdio: {direction} relay closed: \
+                         {error}"
+                    );
+                    return Ok(());
+                }
+
+                return Err(error).with_context(|| format!("{direction} LSP relay failed"));
+            }
+
+            Err(RecvTimeoutError::Timeout) => {}
+
+            Err(RecvTimeoutError::Disconnected) => {
+                relay.shutdown();
+                bail!("both LSP relay workers stopped unexpectedly");
+            }
+        }
+    }
+}
+
+fn install_signal_handlers() -> Result<Arc<AtomicBool>> {
+    let cancellation = Arc::new(AtomicBool::new(false));
+
+    #[cfg(unix)]
+    {
+        use signal_hook::consts::signal::{SIGHUP, SIGINT, SIGTERM};
+
+        for signal in [SIGINT, SIGTERM, SIGHUP] {
+            signal_hook::flag::register(signal, Arc::clone(&cancellation))
+                .with_context(|| format!("failed to register signal handler {signal}"))?;
+        }
+    }
+
+    /*
+     * On non-Unix systems this still returns a cancellation flag. Native
+     * Windows console and Job Object support should be added before Windows
+     * is declared a supported deployment platform.
+     */
+
+    Ok(cancellation)
+}
+
+fn configure_process_group(command: &mut Command) {
+    #[cfg(unix)]
+    {
+        /*
+         * Put tool4d into a new process group. This lets shutdown terminate
+         * tool4d and any processes it starts in the same group.
+         */
+        command.process_group(0);
+    }
+
+    #[cfg(not(unix))]
+    {
+        let _ = command;
+    }
+}
+
+fn terminate_child(child: &mut Child, shutdown_timeout: Duration) {
+    match child.try_wait() {
+        Ok(Some(_)) => return,
+
+        Ok(None) => {}
+
+        Err(error) => {
+            eprintln!(
+                "tool4d-lsp-stdio: failed to inspect tool4d during \
+                 shutdown: {error}"
+            );
+        }
+    }
+
+    eprintln!("tool4d-lsp-stdio: terminating tool4d");
+
+    send_graceful_termination(child);
+
+    match child.wait_timeout(shutdown_timeout) {
+        Ok(Some(_status)) => return,
+
+        Ok(None) => {
+            eprintln!(
+                "tool4d-lsp-stdio: tool4d did not exit within {} \
+                 seconds; forcing termination",
+                shutdown_timeout.as_secs()
+            );
+        }
+
+        Err(error) => {
+            eprintln!(
+                "tool4d-lsp-stdio: failed while waiting for tool4d: \
+                 {error}"
+            );
+        }
+    }
+
+    force_terminate(child);
+
+    if let Err(error) = child.wait() {
+        eprintln!("tool4d-lsp-stdio: failed to reap tool4d: {error}");
+    }
+}
+
+#[cfg(unix)]
+fn send_graceful_termination(child: &mut Child) {
+    let process_group = -(child.id() as libc::pid_t);
+
+    // SAFETY: kill is called with a process-group identifier created for
+    // this child. No Rust memory is accessed through the FFI call.
+    let result = unsafe { libc::kill(process_group, libc::SIGTERM) };
+
+    if result != 0 {
+        let error = io::Error::last_os_error();
+
+        if error.raw_os_error() != Some(libc::ESRCH) {
+            eprintln!(
+                "tool4d-lsp-stdio: failed to terminate tool4d process \
+                 group: {error}"
+            );
+        }
+    }
+}
+
+#[cfg(not(unix))]
+fn send_graceful_termination(child: &mut Child) {
+    if let Err(error) = child.kill() {
+        eprintln!("tool4d-lsp-stdio: failed to terminate tool4d: {error}");
+    }
+}
+
+#[cfg(unix)]
+fn force_terminate(child: &mut Child) {
+    let process_group = -(child.id() as libc::pid_t);
+
+    // SAFETY: kill is called with a process-group identifier created for
+    // this child. No Rust memory is accessed through the FFI call.
+    let result = unsafe { libc::kill(process_group, libc::SIGKILL) };
+
+    if result != 0 {
+        let error = io::Error::last_os_error();
+
+        if error.raw_os_error() != Some(libc::ESRCH) {
+            eprintln!(
+                "tool4d-lsp-stdio: failed to kill tool4d process \
+                 group: {error}"
+            );
+        }
+    }
+}
+
+#[cfg(not(unix))]
+fn force_terminate(child: &mut Child) {
+    if let Err(error) = child.kill() {
+        eprintln!("tool4d-lsp-stdio: failed to kill tool4d: {error}");
+    }
+}
+
+fn forward_tool4d_stdout(stdout: ChildStdout) {
+    thread::spawn(move || {
+        let mut reader = BufReader::new(stdout);
+        let mut line = Vec::new();
+
+        loop {
+            line.clear();
+
+            match reader.read_until(b'\n', &mut line) {
+                Ok(0) => return,
+
+                Ok(_) => {
+                    let stderr = io::stderr();
+                    let mut stderr = stderr.lock();
+
+                    if stderr
+                        .write_all(b"tool4d-lsp-stdio: tool4d stdout: ")
+                        .and_then(|_| stderr.write_all(&line))
+                        .and_then(|_| {
+                            if line.ends_with(b"\n") {
+                                Ok(())
+                            } else {
+                                stderr.write_all(b"\n")
+                            }
+                        })
+                        .and_then(|_| stderr.flush())
+                        .is_err()
+                    {
+                        return;
+                    }
+                }
+
+                Err(error) => {
+                    eprintln!(
+                        "tool4d-lsp-stdio: failed to read tool4d \
+                         stdout: {error}"
+                    );
+                    return;
+                }
+            }
+        }
+    });
+}
+
+fn log_command<'a>(executable: &Path, arguments: impl Iterator<Item = &'a OsStr>) {
+    let rendered_arguments = arguments
+        .map(|argument| format!("{argument:?}"))
+        .collect::<Vec<_>>()
+        .join(" ");
+
+    eprintln!(
+        "tool4d-lsp-stdio: executing {} {}",
+        executable.display(),
+        rendered_arguments
+    );
+}
+
 fn validate_tool(tool: &Path) -> Result<()> {
     if !tool.exists() {
         bail!("tool4d does not exist: {}", tool.display());
@@ -242,6 +634,21 @@ fn validate_tool(tool: &Path) -> Result<()> {
 
     if !tool.is_file() {
         bail!("tool4d path is not a file: {}", tool.display());
+    }
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+
+        let mode = tool
+            .metadata()
+            .with_context(|| format!("failed to inspect {}", tool.display()))?
+            .permissions()
+            .mode();
+
+        if mode & 0o111 == 0 {
+            bail!("tool4d is not executable: {}", tool.display());
+        }
     }
 
     Ok(())
@@ -363,32 +770,9 @@ fn find_projects(directory: &Path, depth: usize, projects: &mut Vec<PathBuf>) ->
     Ok(())
 }
 
-fn should_ignore_directory(name: &std::ffi::OsStr) -> bool {
+fn should_ignore_directory(name: &OsStr) -> bool {
     matches!(
         name.to_str(),
         Some(".git" | ".zed" | "node_modules" | "target" | "build" | "dist")
     )
-}
-
-fn stop_child(child: &mut Child) {
-    match child.try_wait() {
-        Ok(Some(_status)) => return,
-
-        Ok(None) => {}
-
-        Err(error) => {
-            eprintln!(
-                "tool4d-lsp-stdio: failed to inspect tool4d during \
-                 shutdown: {error}"
-            );
-        }
-    }
-
-    if let Err(error) = child.kill() {
-        eprintln!("tool4d-lsp-stdio: failed to terminate tool4d: {error}");
-    }
-
-    if let Err(error) = child.wait() {
-        eprintln!("tool4d-lsp-stdio: failed to wait for tool4d: {error}");
-    }
 }
