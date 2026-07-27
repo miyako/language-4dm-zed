@@ -11,3 +11,10 @@ ctrlc = "3.5.2"
 wait-timeout = "0.2.1"
 libc = "0.2"
 signal-hook = "0.3"
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = [
+    "Win32_Foundation",
+    "Win32_System_JobObjects",
+    "Win32_System_Threading",
+] }
