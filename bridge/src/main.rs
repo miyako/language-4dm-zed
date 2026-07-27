@@ -6,7 +6,7 @@ use std::{
     io::{self, BufRead, BufReader, Write},
     net::{Ipv4Addr, SocketAddr, TcpListener, TcpStream},
     path::{Path, PathBuf},
-    process::{Child, ChildStdout, Command, ExitCode, ExitStatus, Stdio},
+    process::{ChildStdout, Command, ExitCode, Stdio},
     sync::{
         Arc,
         atomic::{AtomicBool, Ordering},
@@ -18,11 +18,8 @@ use std::{
 
 use anyhow::{Context, Result, bail};
 use clap::{ArgAction, Parser, Subcommand};
+use tool4d_lsp_stdio::process::{ChildGuard, configure_process_supervision};
 use tool4d_lsp_stdio::relay::{Relay, RelayEvent};
-use wait_timeout::ChildExt;
-
-#[cfg(unix)]
-use std::os::unix::process::CommandExt;
 
 #[derive(Debug, Parser)]
 #[command(
@@ -105,38 +102,6 @@ enum BridgeCommand {
         #[arg(long)]
         address: SocketAddr,
     },
-}
-
-/// Owns the tool4d process and terminates it when dropped.
-///
-/// This provides cleanup during normal returns, propagated errors, and Rust
-/// panics when panic unwinding is enabled.
-struct ChildGuard {
-    child: Child,
-    shutdown_timeout: Duration,
-}
-
-impl ChildGuard {
-    fn new(child: Child, shutdown_timeout: Duration) -> Self {
-        Self {
-            child,
-            shutdown_timeout,
-        }
-    }
-
-    fn try_wait(&mut self) -> io::Result<Option<ExitStatus>> {
-        self.child.try_wait()
-    }
-
-    fn terminate(&mut self) {
-        terminate_child(&mut self.child, self.shutdown_timeout);
-    }
-}
-
-impl Drop for ChildGuard {
-    fn drop(&mut self) {
-        self.terminate();
-    }
 }
 
 fn main() -> ExitCode {
@@ -242,7 +207,7 @@ fn launch(
         command.arg(format!("--log-level={log_level}"));
     }
 
-    configure_process_group(&mut command);
+    configure_process_supervision(&mut command);
 
     eprintln!("tool4d-lsp-stdio: listening for tool4d on {listener_address}");
 
@@ -256,7 +221,16 @@ fn launch(
         forward_tool4d_stdout(stdout);
     }
 
-    let mut child = ChildGuard::new(child, shutdown_timeout);
+    let mut child = match ChildGuard::new(child, shutdown_timeout) {
+        Ok(child) => child,
+
+        Err((mut child, error)) => {
+            let _ = child.kill();
+            let _ = child.wait();
+
+            return Err(error).context("failed to install process supervision for tool4d");
+        }
+    };
 
     let stream = accept_with_timeout(&listener, &mut child, startup_timeout, &cancellation)?;
 
@@ -459,120 +433,6 @@ fn install_signal_handlers() -> Result<Arc<AtomicBool>> {
      */
 
     Ok(cancellation)
-}
-
-fn configure_process_group(command: &mut Command) {
-    #[cfg(unix)]
-    {
-        /*
-         * Put tool4d into a new process group. This lets shutdown terminate
-         * tool4d and any processes it starts in the same group.
-         */
-        command.process_group(0);
-    }
-
-    #[cfg(not(unix))]
-    {
-        let _ = command;
-    }
-}
-
-fn terminate_child(child: &mut Child, shutdown_timeout: Duration) {
-    match child.try_wait() {
-        Ok(Some(_)) => return,
-
-        Ok(None) => {}
-
-        Err(error) => {
-            eprintln!(
-                "tool4d-lsp-stdio: failed to inspect tool4d during \
-                 shutdown: {error}"
-            );
-        }
-    }
-
-    eprintln!("tool4d-lsp-stdio: terminating tool4d");
-
-    send_graceful_termination(child);
-
-    match child.wait_timeout(shutdown_timeout) {
-        Ok(Some(_status)) => return,
-
-        Ok(None) => {
-            eprintln!(
-                "tool4d-lsp-stdio: tool4d did not exit within {} \
-                 seconds; forcing termination",
-                shutdown_timeout.as_secs()
-            );
-        }
-
-        Err(error) => {
-            eprintln!(
-                "tool4d-lsp-stdio: failed while waiting for tool4d: \
-                 {error}"
-            );
-        }
-    }
-
-    force_terminate(child);
-
-    if let Err(error) = child.wait() {
-        eprintln!("tool4d-lsp-stdio: failed to reap tool4d: {error}");
-    }
-}
-
-#[cfg(unix)]
-fn send_graceful_termination(child: &mut Child) {
-    let process_group = -(child.id() as libc::pid_t);
-
-    // SAFETY: kill is called with a process-group identifier created for
-    // this child. No Rust memory is accessed through the FFI call.
-    let result = unsafe { libc::kill(process_group, libc::SIGTERM) };
-
-    if result != 0 {
-        let error = io::Error::last_os_error();
-
-        if error.raw_os_error() != Some(libc::ESRCH) {
-            eprintln!(
-                "tool4d-lsp-stdio: failed to terminate tool4d process \
-                 group: {error}"
-            );
-        }
-    }
-}
-
-#[cfg(not(unix))]
-fn send_graceful_termination(child: &mut Child) {
-    if let Err(error) = child.kill() {
-        eprintln!("tool4d-lsp-stdio: failed to terminate tool4d: {error}");
-    }
-}
-
-#[cfg(unix)]
-fn force_terminate(child: &mut Child) {
-    let process_group = -(child.id() as libc::pid_t);
-
-    // SAFETY: kill is called with a process-group identifier created for
-    // this child. No Rust memory is accessed through the FFI call.
-    let result = unsafe { libc::kill(process_group, libc::SIGKILL) };
-
-    if result != 0 {
-        let error = io::Error::last_os_error();
-
-        if error.raw_os_error() != Some(libc::ESRCH) {
-            eprintln!(
-                "tool4d-lsp-stdio: failed to kill tool4d process \
-                 group: {error}"
-            );
-        }
-    }
-}
-
-#[cfg(not(unix))]
-fn force_terminate(child: &mut Child) {
-    if let Err(error) = child.kill() {
-        eprintln!("tool4d-lsp-stdio: failed to kill tool4d: {error}");
-    }
 }
 
 fn forward_tool4d_stdout(stdout: ChildStdout) {
