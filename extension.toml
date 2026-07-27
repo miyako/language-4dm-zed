@@ -12,4 +12,4 @@ languages = ["4D"]
 
 [grammars.fourd]
 repository = "https://github.com/miyako/tree-sitter-fourd"
-rev = "8584dd655b37b62ad81bb43484d6fd23bee1f117"
+rev = "8f12f93fa50a86a459d87509eeeca6f1ec1f7624"
