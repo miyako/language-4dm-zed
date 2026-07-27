@@ -234,121 +234,142 @@ jobs:
   windows:
     name: Build and package Windows adapter
     runs-on: windows-latest
-    
-    # The existing macOS job creates the GitHub Release. Waiting for it avoids
-    # racing to upload the Windows assets before that release exists.
     needs:
       - macos
-    
+
     steps:
       - name: Check out repository
         uses: actions/checkout@v4
-    
+
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
         with:
           targets: x86_64-pc-windows-msvc
-    
+
       - name: Build adapter
         shell: pwsh
         run: |
           $ErrorActionPreference = "Stop"
-    
+
           cargo build `
             --manifest-path bridge/Cargo.toml `
             --locked `
             --release `
             --target x86_64-pc-windows-msvc
-    
+
+      - name: Verify Windows executable
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+
+          $binary = Join-Path `
+            "bridge/target/x86_64-pc-windows-msvc/release" `
+            "tool4d-lsp-stdio.exe"
+
+          if (-not (Test-Path $binary -PathType Leaf)) {
+            throw "Windows executable was not found: $binary"
+          }
+
+          $binaryFile = Get-Item $binary
+
+          if ($binaryFile.Length -eq 0) {
+            throw "Windows executable is empty: $binary"
+          }
+
+          Write-Host "Windows executable:"
+          $binaryFile | Format-List FullName, Length
+
       - name: Package adapter
         shell: pwsh
         run: |
           $ErrorActionPreference = "Stop"
-    
+
           $binary = Join-Path `
             "bridge/target/x86_64-pc-windows-msvc/release" `
             "tool4d-lsp-stdio.exe"
-    
-          if (-not (Test-Path $binary -PathType Leaf)) {
-            throw "Windows executable was not found: $binary"
-          }
-    
+
           $packageDir = Join-Path `
             $env:RUNNER_TEMP `
             "tool4d-lsp-stdio"
-    
+
           $asset = `
             "tool4d-lsp-stdio-x86_64-pc-windows-msvc.zip"
-    
+
           if (Test-Path $packageDir) {
             Remove-Item `
               -Path $packageDir `
               -Recurse `
               -Force
           }
-    
+
           New-Item `
             -ItemType Directory `
             -Path $packageDir `
             -Force |
             Out-Null
-    
+
           Copy-Item `
             -Path $binary `
             -Destination (
               Join-Path $packageDir "tool4d-lsp-stdio.exe"
             )
-    
+
           Copy-Item `
-            -Path "README.md" `
+            -Path README.md `
             -Destination (
               Join-Path $packageDir "README.md"
             )
-    
+
           Copy-Item `
-            -Path "LICENSE" `
+            -Path LICENSE `
             -Destination (
               Join-Path $packageDir "LICENSE"
             )
-    
+
           Compress-Archive `
             -Path $packageDir `
             -DestinationPath $asset `
             -CompressionLevel Optimal `
             -Force
-    
+
           if (-not (Test-Path $asset -PathType Leaf)) {
             throw "Windows archive was not created: $asset"
           }
-    
-          Write-Host "Created release asset:"
-          Get-Item $asset | Format-List FullName, Length
-    
+
+          $archive = Get-Item $asset
+
+          if ($archive.Length -eq 0) {
+            throw "Windows archive is empty: $asset"
+          }
+
+          Write-Host "Windows release asset:"
+          $archive | Format-List FullName, Length
+
       - name: Create checksum
         shell: pwsh
         run: |
           $ErrorActionPreference = "Stop"
-    
+
           $asset = `
             "tool4d-lsp-stdio-x86_64-pc-windows-msvc.zip"
-    
+
           $hash = Get-FileHash `
             -Path $asset `
             -Algorithm SHA256
-    
+
           $checksum = (
             $hash.Hash.ToLowerInvariant() +
             "  " +
             $asset
           )
-    
+
           Set-Content `
             -Path "${asset}.sha256" `
             -Value $checksum `
             -Encoding ascii
-    
+
           Get-Content "${asset}.sha256"
-    
+
       - name: Upload workflow artifacts
         uses: actions/upload-artifact@v4
         with:
@@ -357,15 +378,14 @@ jobs:
             tool4d-lsp-stdio-x86_64-pc-windows-msvc.zip
             tool4d-lsp-stdio-x86_64-pc-windows-msvc.zip.sha256
           if-no-files-found: error
-    
+
       - name: Publish GitHub release assets
-        if: startsWith(github.ref, 'refs/tags/')
         env:
           GH_TOKEN: ${{ github.token }}
         shell: pwsh
         run: |
           $ErrorActionPreference = "Stop"
-    
+
           gh release upload `
             $env:GITHUB_REF_NAME `
             "tool4d-lsp-stdio-x86_64-pc-windows-msvc.zip" `
