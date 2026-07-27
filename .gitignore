@@ -1,3 +1,4 @@
 /target
 bridge/target/debug/*
 bridge/target/release/*
+grammars/fourd/
