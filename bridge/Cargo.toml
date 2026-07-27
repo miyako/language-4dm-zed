@@ -2,9 +2,12 @@
 name = "tool4d-lsp-stdio"
 version = "0.1.0"
 edition = "2024"
+publish = false
 
 [dependencies]
 anyhow = "1.0.104"
 clap = { version = "4.6.4", features = ["derive", "env"] }
 ctrlc = "3.5.2"
 wait-timeout = "0.2.1"
+libc = "0.2"
+signal-hook = "0.3"
