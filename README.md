@@ -14,7 +14,7 @@ This extension provides:
 
 - Zed
 - 4D or `tool4d` 21 or later
-- macOS (apple Silicon)
+- macOS (Apple Silicon)
 
 Additional platforms will be documented when corresponding `tool4d`
 and adapter builds have been verified.
