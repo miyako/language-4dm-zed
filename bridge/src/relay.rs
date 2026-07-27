@@ -1,12 +1,50 @@
 use std::{
+    collections::HashSet,
     io::{self, Read, Write},
     net::{Shutdown, TcpStream},
-    sync::mpsc::{self, Receiver, Sender},
+    sync::{
+        mpsc::{self, Receiver, Sender},
+        Arc, Mutex, MutexGuard,
+    },
     thread,
 };
 
+use serde_json::{json, Value};
+
 const MAX_LSP_HEADER_SIZE: usize = 64 * 1024;
 const MAX_LSP_BODY_SIZE: usize = 256 * 1024 * 1024;
+
+/// Shared compatibility state for both directions of an LSP session.
+///
+/// Zed-to-tool4d requests are inspected so that responses can be associated
+/// with the method that produced them. This is currently used only for
+/// `textDocument/diagnostic`.
+#[derive(Default)]
+pub struct CompatibilityState {
+    pending_diagnostic_requests: Mutex<HashSet<RequestId>>,
+}
+
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+enum RequestId {
+    Number(String),
+    String(String),
+}
+
+impl RequestId {
+    fn from_json(value: &Value) -> Option<Self> {
+        match value {
+            Value::Number(number) => {
+                Some(Self::Number(number.to_string()))
+            }
+
+            Value::String(value) => {
+                Some(Self::String(value.clone()))
+            }
+
+            _ => None,
+        }
+    }
+}
 
 /// An event reported by one side of the LSP relay.
 #[derive(Debug)]
@@ -31,10 +69,14 @@ pub struct Relay {
 }
 
 impl Relay {
-    /// Starts relaying:
+    /// Starts the bidirectional LSP relay.
     ///
-    /// - editor stdin to tool4d without modification;
-    /// - tool4d TCP output to editor stdout with normalized LSP headers.
+    /// The relay:
+    ///
+    /// - records IDs of `textDocument/diagnostic` requests;
+    /// - normalizes LSP `Content-Length` headers;
+    /// - repairs invalid `null` diagnostic responses from tool4d;
+    /// - otherwise preserves message bodies byte-for-byte.
     pub fn start(stream: TcpStream) -> io::Result<Self> {
         stream.set_nonblocking(false)?;
         stream.set_nodelay(true)?;
@@ -43,10 +85,22 @@ impl Relay {
         let socket_writer = stream.try_clone()?;
         let control_stream = stream;
 
+        let compatibility_state =
+            Arc::new(CompatibilityState::default());
+
         let (event_sender, event_receiver) = mpsc::channel();
 
-        start_stdin_to_socket(socket_writer, event_sender.clone());
-        start_socket_to_stdout(socket_reader, event_sender);
+        start_stdin_to_socket(
+            socket_writer,
+            event_sender.clone(),
+            Arc::clone(&compatibility_state),
+        );
+
+        start_socket_to_stdout(
+            socket_reader,
+            event_sender,
+            compatibility_state,
+        );
 
         Ok(Self {
             control_stream,
@@ -67,7 +121,8 @@ impl Relay {
             Err(error)
                 if matches!(
                     error.kind(),
-                    io::ErrorKind::NotConnected | io::ErrorKind::BrokenPipe
+                    io::ErrorKind::NotConnected
+                        | io::ErrorKind::BrokenPipe
                 ) => {}
 
             Err(error) => {
@@ -80,17 +135,21 @@ impl Relay {
     }
 }
 
-fn start_stdin_to_socket(mut socket_writer: TcpStream, event_sender: Sender<RelayEvent>) {
+fn start_stdin_to_socket(
+    mut socket_writer: TcpStream,
+    event_sender: Sender<RelayEvent>,
+    compatibility_state: Arc<CompatibilityState>,
+) {
     thread::spawn(move || {
         let result = (|| -> io::Result<()> {
             let stdin = io::stdin();
             let mut stdin = stdin.lock();
 
-            /*
-             * Zed already sends standard LSP framing. Forward this direction
-             * without parsing or modifying it.
-             */
-            io::copy(&mut stdin, &mut socket_writer)?;
+            relay_editor_stream(
+                &mut stdin,
+                &mut socket_writer,
+                &compatibility_state,
+            )?;
 
             match socket_writer.shutdown(Shutdown::Write) {
                 Ok(()) => {}
@@ -98,7 +157,8 @@ fn start_stdin_to_socket(mut socket_writer: TcpStream, event_sender: Sender<Rela
                 Err(error)
                     if matches!(
                         error.kind(),
-                        io::ErrorKind::NotConnected | io::ErrorKind::BrokenPipe
+                        io::ErrorKind::NotConnected
+                            | io::ErrorKind::BrokenPipe
                     ) => {}
 
                 Err(error) => return Err(error),
@@ -123,22 +183,19 @@ fn start_stdin_to_socket(mut socket_writer: TcpStream, event_sender: Sender<Rela
 fn start_socket_to_stdout(
     mut socket_reader: TcpStream,
     event_sender: Sender<RelayEvent>,
+    compatibility_state: Arc<CompatibilityState>,
 ) {
     thread::spawn(move || {
-        let result: io::Result<()> = {
+        let result = (|| -> io::Result<()> {
             let stdout = io::stdout();
             let mut stdout = stdout.lock();
 
-            /*
-             * tool4d emits Content-Length without necessarily including a
-             * space after the colon. Normalize the header before sending it
-             * to Zed.
-             */
-            normalize_lsp_stream(
+            relay_tool4d_stream(
                 &mut socket_reader,
                 &mut stdout,
+                &compatibility_state,
             )
-        };
+        })();
 
         let event = match result {
             Ok(()) => RelayEvent::SocketClosed,
@@ -153,78 +210,240 @@ fn start_socket_to_stdout(
     });
 }
 
-/// Reads LSP frames from `input` and writes them to `output`.
+/// Relays editor-to-tool4d LSP messages.
 ///
-/// The JSON-RPC body is copied byte-for-byte. Only the LSP header is
-/// normalized. For example:
-///
-/// ```text
-/// Content-Length:1655\r\n\r\n
-/// ```
-///
-/// becomes:
-///
-/// ```text
-/// Content-Length: 1655\r\n\r\n
-/// ```
-///
-/// Additional headers are preserved.
-pub fn normalize_lsp_stream<R, W>(mut input: R, mut output: W) -> io::Result<()>
+/// Message bodies are forwarded byte-for-byte. Requests whose method is
+/// `textDocument/diagnostic` are recorded before they are sent to tool4d.
+pub fn relay_editor_stream<R, W>(
+    mut input: R,
+    mut output: W,
+    state: &CompatibilityState,
+) -> io::Result<()>
 where
     R: Read,
     W: Write,
 {
-    loop {
-        let Some(header) = read_lsp_header(&mut input)? else {
-            // EOF before another frame begins is a clean socket shutdown.
-            output.flush()?;
-            return Ok(());
-        };
+    while let Some(frame) = read_lsp_frame(&mut input)? {
+        remember_diagnostic_request(&frame.body, state)?;
+        write_lsp_frame(&mut output, &frame)?;
+    }
 
-        let parsed_header = parse_lsp_header(&header)?;
+    output.flush()
+}
 
-        if parsed_header.content_length > MAX_LSP_BODY_SIZE {
-            return Err(invalid_data(format!(
-                "LSP body length {} exceeds the maximum of {} bytes",
-                parsed_header.content_length, MAX_LSP_BODY_SIZE
-            )));
-        }
+/// Relays tool4d-to-editor LSP messages.
+///
+/// If a response corresponds to a recorded `textDocument/diagnostic`
+/// request and has `result: null`, it is converted to an empty full
+/// diagnostic report.
+pub fn relay_tool4d_stream<R, W>(
+    mut input: R,
+    mut output: W,
+    state: &CompatibilityState,
+) -> io::Result<()>
+where
+    R: Read,
+    W: Write,
+{
+    while let Some(mut frame) = read_lsp_frame(&mut input)? {
+        rewrite_null_diagnostic_response(&mut frame.body, state)?;
+        write_lsp_frame(&mut output, &frame)?;
+    }
 
-        write!(
-            output,
-            "Content-Length: {}\r\n",
-            parsed_header.content_length
-        )?;
+    output.flush()
+}
 
-        for additional_header in parsed_header.additional_headers {
-            output.write_all(&additional_header)?;
-            output.write_all(b"\r\n")?;
-        }
+/// Reads LSP frames and writes them with canonical `Content-Length` headers.
+///
+/// This function does not inspect or modify JSON-RPC bodies.
+pub fn normalize_lsp_stream<R, W>(
+    mut input: R,
+    mut output: W,
+) -> io::Result<()>
+where
+    R: Read,
+    W: Write,
+{
+    while let Some(frame) = read_lsp_frame(&mut input)? {
+        write_lsp_frame(&mut output, &frame)?;
+    }
 
-        output.write_all(b"\r\n")?;
+    output.flush()
+}
 
-        let body_length = u64::try_from(parsed_header.content_length)
-            .map_err(|_| invalid_data("LSP body length is too large"))?;
+struct LspFrame {
+    additional_headers: Vec<Vec<u8>>,
+    body: Vec<u8>,
+}
 
-        let mut body = input.by_ref().take(body_length);
-        let copied = io::copy(&mut body, &mut output)?;
+fn read_lsp_frame<R>(
+    input: &mut R,
+) -> io::Result<Option<LspFrame>>
+where
+    R: Read,
+{
+    let Some(header) = read_lsp_header(input)? else {
+        return Ok(None);
+    };
 
-        if copied != body_length {
-            return Err(io::Error::new(
+    let parsed_header = parse_lsp_header(&header)?;
+
+    if parsed_header.content_length > MAX_LSP_BODY_SIZE {
+        return Err(invalid_data(format!(
+            "LSP body length {} exceeds the maximum of {} bytes",
+            parsed_header.content_length,
+            MAX_LSP_BODY_SIZE
+        )));
+    }
+
+    let mut body = vec![0_u8; parsed_header.content_length];
+
+    input.read_exact(&mut body).map_err(|error| {
+        if error.kind() == io::ErrorKind::UnexpectedEof {
+            io::Error::new(
                 io::ErrorKind::UnexpectedEof,
                 format!(
-                    "LSP body was truncated: expected {body_length} bytes, \
-                     received {copied}"
+                    "LSP body was truncated: expected {} bytes",
+                    parsed_header.content_length
                 ),
-            ));
+            )
+        } else {
+            error
         }
+    })?;
 
-        /*
-         * Flush after each frame so that initialization responses and other
-         * messages are delivered to Zed immediately.
-         */
-        output.flush()?;
+    Ok(Some(LspFrame {
+        additional_headers: parsed_header.additional_headers,
+        body,
+    }))
+}
+
+fn write_lsp_frame<W>(
+    output: &mut W,
+    frame: &LspFrame,
+) -> io::Result<()>
+where
+    W: Write,
+{
+    write!(
+        output,
+        "Content-Length: {}\r\n",
+        frame.body.len()
+    )?;
+
+    for header in &frame.additional_headers {
+        output.write_all(header)?;
+        output.write_all(b"\r\n")?;
     }
+
+    output.write_all(b"\r\n")?;
+    output.write_all(&frame.body)?;
+    output.flush()
+}
+
+fn remember_diagnostic_request(
+    body: &[u8],
+    state: &CompatibilityState,
+) -> io::Result<()> {
+    let Ok(message) = serde_json::from_slice::<Value>(body) else {
+        /*
+         * Framing remains transparent for non-JSON or malformed payloads.
+         * tool4d will decide how to handle the payload.
+         */
+        return Ok(());
+    };
+
+    if message
+        .get("method")
+        .and_then(Value::as_str)
+        != Some("textDocument/diagnostic")
+    {
+        return Ok(());
+    }
+
+    let Some(request_id) = message
+        .get("id")
+        .and_then(RequestId::from_json)
+    else {
+        /*
+         * A JSON-RPC notification has no response and therefore must not be
+         * added to the pending request set.
+         */
+        return Ok(());
+    };
+
+    lock_pending_diagnostics(state)?.insert(request_id);
+
+    Ok(())
+}
+
+fn rewrite_null_diagnostic_response(
+    body: &mut Vec<u8>,
+    state: &CompatibilityState,
+) -> io::Result<()> {
+    let Ok(mut message) = serde_json::from_slice::<Value>(body.as_slice())
+    else {
+        return Ok(());
+    };
+
+    let Some(request_id) = message
+        .get("id")
+        .and_then(RequestId::from_json)
+    else {
+        return Ok(());
+    };
+
+    /*
+     * Consume the pending ID as soon as any matching response arrives.
+     * This includes valid reports and JSON-RPC error responses.
+     */
+    let is_diagnostic_response =
+        lock_pending_diagnostics(state)?.remove(&request_id);
+
+    if !is_diagnostic_response {
+        return Ok(());
+    }
+
+    if message.get("error").is_some() {
+        return Ok(());
+    }
+
+    if message.get("result") != Some(&Value::Null) {
+        return Ok(());
+    }
+
+    let Some(object) = message.as_object_mut() else {
+        return Ok(());
+    };
+
+    object.insert(
+        "result".to_owned(),
+        json!({
+            "kind": "full",
+            "items": []
+        }),
+    );
+
+    *body = serde_json::to_vec(&message).map_err(|error| {
+        invalid_data(format!(
+            "failed to serialize repaired diagnostic response: {error}"
+        ))
+    })?;
+
+    Ok(())
+}
+
+fn lock_pending_diagnostics(
+    state: &CompatibilityState,
+) -> io::Result<MutexGuard<'_, HashSet<RequestId>>> {
+    state
+        .pending_diagnostic_requests
+        .lock()
+        .map_err(|_| {
+            io::Error::other(
+                "pending diagnostic request state is poisoned",
+            )
+        })
 }
 
 struct ParsedHeader {
@@ -235,7 +454,9 @@ struct ParsedHeader {
 /// Reads one LSP header block, excluding the final CRLF-CRLF delimiter.
 ///
 /// `Ok(None)` means the stream reached EOF before another frame started.
-fn read_lsp_header<R>(input: &mut R) -> io::Result<Option<Vec<u8>>>
+fn read_lsp_header<R>(
+    input: &mut R,
+) -> io::Result<Option<Vec<u8>>>
 where
     R: Read,
 {
@@ -266,12 +487,17 @@ where
                 }
 
                 if header.ends_with(HEADER_END) {
-                    header.truncate(header.len() - HEADER_END.len());
+                    header.truncate(
+                        header.len() - HEADER_END.len(),
+                    );
+
                     return Ok(Some(header));
                 }
             }
 
-            Err(error) if error.kind() == io::ErrorKind::Interrupted => {
+            Err(error)
+                if error.kind() == io::ErrorKind::Interrupted =>
+            {
                 continue;
             }
 
@@ -280,36 +506,25 @@ where
     }
 }
 
-fn parse_lsp_header(header: &[u8]) -> io::Result<ParsedHeader> {
+fn parse_lsp_header(
+    header: &[u8],
+) -> io::Result<ParsedHeader> {
     if header.is_empty() {
         return Err(invalid_data("empty LSP header"));
     }
 
     let mut content_length = None;
     let mut additional_headers = Vec::new();
+    let mut remaining = header;
 
-    let lines = header.split(|byte| *byte == b'\n').collect::<Vec<_>>();
-    let last_line_index = lines.len() - 1;
+    loop {
+        let (line, rest) = match find_crlf(remaining) {
+            Some(position) => (
+                &remaining[..position],
+                Some(&remaining[position + 2..]),
+            ),
 
-    for (index, raw_line) in lines.into_iter().enumerate() {
-        /*
-         * read_lsp_header removes the final CRLF-CRLF delimiter. As a result:
-         *
-         * - every header line except the final one still ends in CR;
-         * - the final header line has no trailing CR.
-         */
-        let line = if index == last_line_index {
-            if raw_line.ends_with(b"\r") {
-                return Err(invalid_data(
-                    "unexpected carriage return at the end of LSP header",
-                ));
-            }
-
-            raw_line
-        } else {
-            raw_line.strip_suffix(b"\r").ok_or_else(|| {
-                invalid_data("LSP header lines must end with CRLF")
-            })?
+            None => (remaining, None),
         };
 
         if line.is_empty() {
@@ -318,59 +533,31 @@ fn parse_lsp_header(header: &[u8]) -> io::Result<ParsedHeader> {
             ));
         }
 
-        let colon_position = line
-            .iter()
-            .position(|byte| *byte == b':')
-            .ok_or_else(|| {
-                invalid_data("LSP header line has no colon")
-            })?;
+        parse_lsp_header_line(
+            line,
+            &mut content_length,
+            &mut additional_headers,
+        )?;
 
-        let name = trim_ascii_whitespace(&line[..colon_position]);
-        let value =
-            trim_ascii_whitespace(&line[colon_position + 1..]);
+        match rest {
+            Some(rest) => {
+                remaining = rest;
 
-        if name.is_empty() {
-            return Err(invalid_data("LSP header name is empty"));
-        }
-
-        if name.eq_ignore_ascii_case(b"Content-Length") {
-            if content_length.is_some() {
-                return Err(invalid_data(
-                    "duplicate Content-Length header",
-                ));
+                if remaining.is_empty() {
+                    return Err(invalid_data(
+                        "unexpected empty line inside LSP header",
+                    ));
+                }
             }
 
-            let value = std::str::from_utf8(value).map_err(|_| {
-                invalid_data(
-                    "Content-Length contains non-UTF-8 bytes",
-                )
-            })?;
-
-            if value.is_empty()
-                || !value.bytes().all(|byte| byte.is_ascii_digit())
-            {
-                return Err(invalid_data(
-                    "Content-Length is not a decimal integer",
-                ));
-            }
-
-            let length = value.parse::<usize>().map_err(|_| {
-                invalid_data("Content-Length is out of range")
-            })?;
-
-            content_length = Some(length);
-        } else {
-            /*
-             * Preserve additional header lines without their line endings.
-             * The canonical CRLF is restored when the header is written.
-             */
-            additional_headers.push(line.to_vec());
+            None => break,
         }
     }
 
-    let content_length = content_length.ok_or_else(|| {
-        invalid_data("missing Content-Length header")
-    })?;
+    let content_length = content_length
+        .ok_or_else(|| {
+            invalid_data("missing Content-Length header")
+        })?;
 
     Ok(ParsedHeader {
         content_length,
@@ -378,28 +565,111 @@ fn parse_lsp_header(header: &[u8]) -> io::Result<ParsedHeader> {
     })
 }
 
+fn find_crlf(value: &[u8]) -> Option<usize> {
+    value
+        .windows(2)
+        .position(|window| window == b"\r\n")
+}
+
+fn parse_lsp_header_line(
+    line: &[u8],
+    content_length: &mut Option<usize>,
+    additional_headers: &mut Vec<Vec<u8>>,
+) -> io::Result<()> {
+    if line.contains(&b'\r') || line.contains(&b'\n') {
+        return Err(invalid_data(
+            "LSP header lines must be separated by CRLF",
+        ));
+    }
+
+    let colon_position = line
+        .iter()
+        .position(|byte| *byte == b':')
+        .ok_or_else(|| {
+            invalid_data("LSP header line has no colon")
+        })?;
+
+    let name =
+        trim_ascii_whitespace(&line[..colon_position]);
+
+    let value =
+        trim_ascii_whitespace(&line[colon_position + 1..]);
+
+    if name.is_empty() {
+        return Err(invalid_data("LSP header name is empty"));
+    }
+
+    if name.eq_ignore_ascii_case(b"Content-Length") {
+        if content_length.is_some() {
+            return Err(invalid_data(
+                "duplicate Content-Length header",
+            ));
+        }
+
+        let value = std::str::from_utf8(value).map_err(|_| {
+            invalid_data(
+                "Content-Length contains non-UTF-8 bytes",
+            )
+        })?;
+
+        if value.is_empty()
+            || !value
+                .bytes()
+                .all(|byte| byte.is_ascii_digit())
+        {
+            return Err(invalid_data(
+                "Content-Length is not a decimal integer",
+            ));
+        }
+
+        let length = value.parse::<usize>().map_err(|_| {
+            invalid_data("Content-Length is out of range")
+        })?;
+
+        *content_length = Some(length);
+    } else {
+        additional_headers.push(line.to_vec());
+    }
+
+    Ok(())
+}
+
 fn trim_ascii_whitespace(mut value: &[u8]) -> &[u8] {
-    while value.first().is_some_and(|byte| byte.is_ascii_whitespace()) {
+    while value
+        .first()
+        .is_some_and(|byte| byte.is_ascii_whitespace())
+    {
         value = &value[1..];
     }
 
-    while value.last().is_some_and(|byte| byte.is_ascii_whitespace()) {
+    while value
+        .last()
+        .is_some_and(|byte| byte.is_ascii_whitespace())
+    {
         value = &value[..value.len() - 1];
     }
 
     value
 }
 
-fn invalid_data(message: impl Into<String>) -> io::Error {
-    io::Error::new(io::ErrorKind::InvalidData, message.into())
+fn invalid_data(
+    message: impl Into<String>,
+) -> io::Error {
+    io::Error::new(
+        io::ErrorKind::InvalidData,
+        message.into(),
+    )
 }
 
 /// Relays arbitrary input and output streams to a TCP connection.
 ///
-/// This helper retains raw byte-relay behavior and is intended for generic
-/// transport tests. Use `normalize_lsp_stream` when testing tool4d output
-/// framing.
-pub fn streams_to_tcp<R, W>(mut input: R, mut output: W, stream: TcpStream) -> io::Result<()>
+/// This generic helper retains raw byte-relay behavior. Production tool4d
+/// sessions use `Relay`, which applies LSP framing and compatibility handling.
+pub fn streams_to_tcp<R, W>(
+    mut input: R,
+    mut output: W,
+    stream: TcpStream,
+) -> io::Result<()>
 where
     R: Read + Send + 'static,
     W: Write,
