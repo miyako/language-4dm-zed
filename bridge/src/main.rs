@@ -1051,16 +1051,9 @@ fn collect_macos_application_candidates(
     Ok(())
 }
 
+#[cfg(target_os = "macos")]
 fn home_directory() -> Option<PathBuf> {
-    #[cfg(windows)]
-    {
-        env::var_os("USERPROFILE").map(PathBuf::from)
-    }
-
-    #[cfg(not(windows))]
-    {
-        env::var_os("HOME").map(PathBuf::from)
-    }
+    env::var_os("HOME").map(PathBuf::from)
 }
 
 fn validate_tool(tool: &Path) -> Result<()> {
