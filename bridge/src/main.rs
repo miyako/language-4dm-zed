@@ -1,5 +1,6 @@
 use std::{
-    net::{IpAddr, Ipv4Addr, SocketAddr, TcpListener, TcpStream},
+    io,
+    net::{Ipv4Addr, SocketAddr, TcpListener, TcpStream},
     path::{Path, PathBuf},
     process::{Child, Command, ExitCode, Stdio},
     thread,
@@ -14,7 +15,7 @@ use tool4d_lsp_stdio::relay;
 #[command(
     name = "tool4d-lsp-stdio",
     version,
-    about = "Bridge stdio LSP clients to the tool4d TCP language server"
+    about = "Bridge a stdio LSP client to the tool4d TCP language server"
 )]
 struct Cli {
     #[command(subcommand)]
@@ -23,7 +24,7 @@ struct Cli {
 
 #[derive(Debug, Subcommand)]
 enum BridgeCommand {
-    /// Start tool4d and connect stdio to its TCP language server.
+    /// Start tool4d and relay its TCP connection over stdin/stdout.
     Launch {
         /// Path to the tool4d executable.
         #[arg(long, env = "TOOL4D_PATH")]
@@ -33,17 +34,27 @@ enum BridgeCommand {
         #[arg(long, env = "TOOL4D_PROJECT")]
         project: Option<PathBuf>,
 
-        /// Workspace in which to find a .4DProject file.
+        /// Workspace in which to search for a .4DProject file.
         #[arg(long)]
         workspace: Option<PathBuf>,
 
-        /// Time to wait for the tool4d TCP server.
+        /// Local TCP port on which to listen for tool4d.
+        ///
+        /// If omitted, the operating system chooses an available port.
+        #[arg(long, env = "TOOL4D_LSP_PORT")]
+        port: Option<u16>,
+
+        /// Number of seconds to wait for tool4d to connect.
         #[arg(long, default_value_t = 30)]
         startup_timeout: u64,
     },
 
-    /// Connect stdio to an already-running TCP language server.
+    /// Connect stdin/stdout to an already-listening TCP service.
+    ///
+    /// This generic mode is not used when launching tool4d, because tool4d is
+    /// itself a TCP client.
     Connect {
+        /// Address of the existing TCP service.
         #[arg(long)]
         address: SocketAddr,
     },
@@ -52,8 +63,9 @@ enum BridgeCommand {
 fn main() -> ExitCode {
     match run() {
         Ok(()) => ExitCode::SUCCESS,
+
         Err(error) => {
-            // stdout belongs exclusively to LSP.
+            // Standard output is reserved exclusively for LSP data.
             eprintln!("tool4d-lsp-stdio: {error:#}");
             ExitCode::FAILURE
         }
@@ -64,70 +76,166 @@ fn run() -> Result<()> {
     let cli = Cli::parse();
 
     match cli.command {
-        BridgeCommand::Connect { address } => {
-            let stream = TcpStream::connect(address)
-                .with_context(|| format!("failed to connect to {address}"))?;
-
-            relay::stdio_to_tcp(stream)?;
-        }
-
         BridgeCommand::Launch {
             tool,
             project,
             workspace,
+            port,
             startup_timeout,
-        } => {
-            launch(
-                &tool,
-                project.as_deref(),
-                workspace.as_deref(),
-                Duration::from_secs(startup_timeout),
-            )?;
+        } => launch(
+            &tool,
+            project.as_deref(),
+            workspace.as_deref(),
+            port,
+            Duration::from_secs(startup_timeout),
+        ),
+
+        BridgeCommand::Connect { address } => {
+            let stream = TcpStream::connect(address)
+                .with_context(|| format!("failed to connect to {address}"))?;
+
+            relay::stdio_to_tcp(stream).context("the TCP stream relay failed")
         }
     }
-
-    Ok(())
 }
 
 fn launch(
     tool: &Path,
     explicit_project: Option<&Path>,
     workspace: Option<&Path>,
+    requested_port: Option<u16>,
     startup_timeout: Duration,
 ) -> Result<()> {
-    validate_executable(tool)?;
+    validate_tool(tool)?;
 
     let project = resolve_project(explicit_project, workspace)?;
 
-    let port = choose_port()?;
-    let address = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), port);
+    /*
+     * tool4d is the TCP client. The bridge must therefore bind and retain the
+     * listening socket before launching tool4d.
+     */
+    let listener = create_listener(requested_port)?;
+    let listener_address = listener
+        .local_addr()
+        .context("failed to obtain the bridge listener address")?;
+
+    let port = listener_address.port();
+
+    let project_argument = format!("--project={}", project.display());
+    let lsp_argument = format!("--lsp={port}");
+
+    eprintln!("tool4d-lsp-stdio: listening for tool4d on {listener_address}");
 
     eprintln!(
-        "tool4d-lsp-stdio: starting {} for {} on {}",
+        "tool4d-lsp-stdio: executing {} {:?} {:?}",
         tool.display(),
-        project.display(),
-        address
+        project_argument,
+        lsp_argument
     );
 
     let mut child = Command::new(tool)
-        .arg(format!("--project={}", project.display()))
-        .arg(format!("--lsp={port}"))
+        .arg(&project_argument)
+        .arg(&lsp_argument)
         .stdin(Stdio::null())
-        // Do not inherit stdout because adapter stdout is the LSP channel.
-        .stdout(Stdio::inherit())
+        /*
+         * Adapter stdout belongs to Zed's LSP transport. Never allow child
+         * process output to enter it.
+         */
+        .stdout(Stdio::null())
         .stderr(Stdio::inherit())
         .spawn()
         .with_context(|| format!("failed to start {}", tool.display()))?;
 
-    let result = connect_with_retry(address, &mut child, startup_timeout)
-        .and_then(|stream| relay::stdio_to_tcp(stream).map_err(Into::into));
+    let result = match accept_with_timeout(&listener, &mut child, startup_timeout) {
+        Ok(stream) => {
+            // Only one connection is needed.
+            drop(listener);
+
+            relay::stdio_to_tcp(stream).context("the LSP stream relay failed")
+        }
+
+        Err(error) => Err(error),
+    };
 
     stop_child(&mut child);
 
     result
 }
 
-fn validate_executable(tool: &Path) -> Result<()> {
+fn create_listener(requested_port: Option<u16>) -> Result<TcpListener> {
+    let port = requested_port.unwrap_or(0);
+
+    let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, port)).with_context(|| {
+        if port == 0 {
+            "failed to bind a local TCP listener".to_owned()
+        } else {
+            format!("failed to bind local TCP port {port}")
+        }
+    })?;
+
+    listener
+        .set_nonblocking(true)
+        .context("failed to configure the local TCP listener")?;
+
+    Ok(listener)
+}
+
+fn accept_with_timeout(
+    listener: &TcpListener,
+    child: &mut Child,
+    timeout: Duration,
+) -> Result<TcpStream> {
+    let started = Instant::now();
+
+    loop {
+        match listener.accept() {
+            Ok((stream, peer_address)) => {
+                if !peer_address.ip().is_loopback() {
+                    bail!("rejected a non-loopback connection from {peer_address}");
+                }
+
+                // The listener is nonblocking so that we can monitor the child process
+                // and enforce a startup timeout. The established LSP stream must be
+                // switched back to blocking mode before io::copy is used.
+                stream
+                    .set_nonblocking(false)
+                    .context("failed to make the tool4d connection blocking")?;
+
+                stream
+                    .set_nodelay(true)
+                    .context("failed to configure the tool4d connection")?;
+
+                eprintln!("tool4d-lsp-stdio: tool4d connected from {peer_address}");
+
+                return Ok(stream);
+            }
+
+            Err(error) if error.kind() == io::ErrorKind::WouldBlock => {}
+
+            Err(error) => {
+                return Err(error).context("failed while accepting the tool4d connection");
+            }
+        }
+
+        if let Some(status) = child
+            .try_wait()
+            .context("failed to inspect the tool4d process")?
+        {
+            bail!("tool4d exited before connecting to the bridge: {status}");
+        }
+
+        if started.elapsed() >= timeout {
+            bail!(
+                "timed out after {} seconds waiting for tool4d to connect",
+                timeout.as_secs()
+            );
+        }
+
+        thread::sleep(Duration::from_millis(50));
+    }
+}
+
+fn validate_tool(tool: &Path) -> Result<()> {
     if !tool.exists() {
         bail!("tool4d does not exist: {}", tool.display());
     }
@@ -144,158 +252,143 @@ fn resolve_project(explicit_project: Option<&Path>, workspace: Option<&Path>) ->
         return validate_project(project);
     }
 
-    let workspace = workspace.context("no project was supplied; use --project or --workspace")?;
+    let workspace =
+        workspace.context("no 4D project was supplied; use --project or --workspace")?;
+
+    if !workspace.is_dir() {
+        bail!("workspace is not a directory: {}", workspace.display());
+    }
 
     let mut projects = Vec::new();
-    find_projects(workspace, workspace, 0, &mut projects)?;
+
+    find_projects(workspace, 0, &mut projects)?;
+
+    projects.sort();
+    projects.dedup();
 
     match projects.len() {
-        0 => bail!("no .4DProject file was found under {}", workspace.display()),
+        0 => {
+            bail!("no .4DProject file was found under {}", workspace.display());
+        }
+
         1 => Ok(projects.remove(0)),
+
         _ => {
-            let list = projects
+            let project_list = projects
                 .iter()
                 .map(|path| format!("  {}", path.display()))
                 .collect::<Vec<_>>()
                 .join("\n");
 
-            bail!("multiple .4DProject files were found; use --project:\n{list}")
+            bail!(
+                "multiple .4DProject files were found; \
+                 use --project explicitly:\n{project_list}"
+            );
         }
     }
 }
 
 fn validate_project(project: &Path) -> Result<PathBuf> {
     if !project.is_file() {
-        bail!("4D project does not exist: {}", project.display());
+        bail!(
+            "4D project does not exist or is not a file: {}",
+            project.display()
+        );
     }
 
-    let valid_suffix = project
-        .extension()
-        .and_then(|extension| extension.to_str())
-        .is_some_and(|extension| extension.eq_ignore_ascii_case("4DProject"));
-
-    if !valid_suffix {
+    if !has_4d_project_extension(project) {
         bail!(
-            "the project path does not end in .4DProject: {}",
+            "project path does not end in .4DProject: {}",
             project.display()
         );
     }
 
     project
         .canonicalize()
-        .with_context(|| format!("cannot resolve {}", project.display()))
+        .with_context(|| format!("failed to resolve {}", project.display()))
 }
 
-fn find_projects(
-    root: &Path,
-    directory: &Path,
-    depth: usize,
-    projects: &mut Vec<PathBuf>,
-) -> Result<()> {
+fn has_4d_project_extension(path: &Path) -> bool {
+    path.extension()
+        .and_then(|extension| extension.to_str())
+        .is_some_and(|extension| extension.eq_ignore_ascii_case("4DProject"))
+}
+
+fn find_projects(directory: &Path, depth: usize, projects: &mut Vec<PathBuf>) -> Result<()> {
     const MAX_DEPTH: usize = 6;
+    const MAX_PROJECTS: usize = 100;
 
     if depth > MAX_DEPTH {
         return Ok(());
     }
 
-    for entry in std::fs::read_dir(directory)
-        .with_context(|| format!("cannot read {}", directory.display()))?
-    {
-        let entry = entry?;
+    let entries = std::fs::read_dir(directory)
+        .with_context(|| format!("failed to read {}", directory.display()))?;
+
+    for entry in entries {
+        let entry = entry
+            .with_context(|| format!("failed to read an entry under {}", directory.display()))?;
+
         let path = entry.path();
-        let file_type = entry.file_type()?;
+        let file_type = entry
+            .file_type()
+            .with_context(|| format!("failed to inspect {}", path.display()))?;
+
+        if file_type.is_symlink() {
+            continue;
+        }
 
         if file_type.is_dir() {
-            let name = entry.file_name();
-
-            if matches!(name.to_str(), Some(".git" | "node_modules" | "target")) {
+            if should_ignore_directory(&entry.file_name()) {
                 continue;
             }
 
-            find_projects(root, &path, depth + 1, projects)?;
-        } else if file_type.is_file() {
-            let is_project = path
-                .extension()
-                .and_then(|extension| extension.to_str())
-                .is_some_and(|extension| extension.eq_ignore_ascii_case("4DProject"));
+            find_projects(&path, depth + 1, projects)?;
+            continue;
+        }
 
-            if is_project {
-                projects.push(path.canonicalize()?);
+        if file_type.is_file() && has_4d_project_extension(&path) {
+            let canonical_path = path
+                .canonicalize()
+                .with_context(|| format!("failed to resolve {}", path.display()))?;
+
+            projects.push(canonical_path);
+
+            if projects.len() > MAX_PROJECTS {
+                bail!("more than {MAX_PROJECTS} .4DProject files were found");
             }
         }
-    }
-
-    projects.sort();
-    projects.dedup();
-
-    // Prevent an unexpectedly large search result from consuming resources.
-    if projects.len() > 100 {
-        bail!(
-            "more than 100 .4DProject files were found under {}",
-            root.display()
-        );
     }
 
     Ok(())
 }
 
-fn choose_port() -> Result<u16> {
-    let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
-        .context("failed to allocate a loopback port")?;
-
-    let port = listener.local_addr()?.port();
-
-    // tool4d must bind the port itself.
-    drop(listener);
-
-    Ok(port)
-}
-
-fn connect_with_retry(
-    address: SocketAddr,
-    child: &mut Child,
-    timeout: Duration,
-) -> Result<TcpStream> {
-    let started = Instant::now();
-    let retry_delay = Duration::from_millis(100);
-
-    loop {
-        if let Some(status) = child.try_wait()? {
-            bail!("tool4d exited before opening the LSP socket: {status}");
-        }
-
-        match TcpStream::connect_timeout(&address, Duration::from_millis(250)) {
-            Ok(stream) => {
-                stream.set_nodelay(true)?;
-                return Ok(stream);
-            }
-
-            Err(error) if started.elapsed() < timeout => {
-                eprintln!("tool4d-lsp-stdio: waiting for {address}: {error}");
-                thread::sleep(retry_delay);
-            }
-
-            Err(error) => {
-                bail!("timed out waiting for tool4d at {address}: {error}");
-            }
-        }
-    }
+fn should_ignore_directory(name: &std::ffi::OsStr) -> bool {
+    matches!(
+        name.to_str(),
+        Some(".git" | ".zed" | "node_modules" | "target" | "build" | "dist")
+    )
 }
 
 fn stop_child(child: &mut Child) {
     match child.try_wait() {
-        Ok(Some(_)) => return,
+        Ok(Some(_status)) => return,
+
         Ok(None) => {}
+
         Err(error) => {
-            eprintln!("tool4d-lsp-stdio: could not inspect tool4d: {error}");
+            eprintln!(
+                "tool4d-lsp-stdio: failed to inspect tool4d during \
+                 shutdown: {error}"
+            );
         }
     }
 
     if let Err(error) = child.kill() {
-        eprintln!("tool4d-lsp-stdio: could not terminate tool4d: {error}");
+        eprintln!("tool4d-lsp-stdio: failed to terminate tool4d: {error}");
     }
 
     if let Err(error) = child.wait() {
-        eprintln!("tool4d-lsp-stdio: could not wait for tool4d: {error}");
+        eprintln!("tool4d-lsp-stdio: failed to wait for tool4d: {error}");
     }
 }

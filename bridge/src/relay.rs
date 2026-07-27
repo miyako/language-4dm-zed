@@ -4,6 +4,10 @@ use std::{
     thread,
 };
 
+/// Relays the process's stdin/stdout to an established TCP connection.
+///
+/// Standard output is reserved exclusively for LSP protocol data. All
+/// diagnostics must be written to standard error.
 pub fn stdio_to_tcp(stream: TcpStream) -> io::Result<()> {
     stream.set_nodelay(true)?;
 
@@ -19,6 +23,7 @@ pub fn stdio_to_tcp(stream: TcpStream) -> io::Result<()> {
 
             match socket_writer.shutdown(Shutdown::Write) {
                 Ok(()) => Ok(()),
+
                 Err(error)
                     if matches!(
                         error.kind(),
@@ -27,6 +32,7 @@ pub fn stdio_to_tcp(stream: TcpStream) -> io::Result<()> {
                 {
                     Ok(())
                 }
+
                 Err(error) => Err(error),
             }
         })();
@@ -43,6 +49,9 @@ pub fn stdio_to_tcp(stream: TcpStream) -> io::Result<()> {
     stdout.flush()
 }
 
+/// Relays an arbitrary input/output pair to an established TCP connection.
+///
+/// This function is intended for automated tests and reuse by other clients.
 pub fn streams_to_tcp<R, W>(mut input: R, mut output: W, stream: TcpStream) -> io::Result<()>
 where
     R: Read + Send + 'static,
