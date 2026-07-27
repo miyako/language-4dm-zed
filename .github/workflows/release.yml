@@ -7,7 +7,7 @@ on:
   workflow_dispatch:
 
 permissions:
-  contents: write
+  contents: read
 
 jobs:
   macos:
@@ -23,23 +23,33 @@ jobs:
         uses: dtolnay/rust-toolchain@stable
 
       - name: Build adapter
+        shell: bash
         run: |
+          set -euo pipefail
+
           cargo build \
             --manifest-path bridge/Cargo.toml \
             --locked \
             --release
 
-      - name: Verify runner architecture
+      - name: Verify runner and binary architecture
         shell: bash
         run: |
           set -euo pipefail
 
+          BINARY="bridge/target/release/tool4d-lsp-stdio"
+
           echo "Runner architecture: $(uname -m)"
-          file bridge/target/release/tool4d-lsp-stdio
+          file "$BINARY"
 
           if [[ "$(uname -m)" != "arm64" ]]; then
-            echo "This workflow currently publishes an aarch64 artifact."
-            echo "The selected runner is not arm64."
+            echo "This job publishes an aarch64 macOS artifact."
+            echo "The selected GitHub runner is not arm64."
+            exit 1
+          fi
+
+          if ! file "$BINARY" | grep -q "arm64"; then
+            echo "The compiled binary is not an arm64 executable."
             exit 1
           fi
 
@@ -51,6 +61,21 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
+
+          if [[ -z "${P12_BASE64:-}" ]]; then
+            echo "APPLE_DEVELOPER_ID_P12_BASE64 is not configured"
+            exit 1
+          fi
+
+          if [[ -z "${P12_PASSWORD:-}" ]]; then
+            echo "APPLE_DEVELOPER_ID_P12_PASSWORD is not configured"
+            exit 1
+          fi
+
+          if [[ -z "${KEYCHAIN_PASSWORD:-}" ]]; then
+            echo "MACOS_KEYCHAIN_PASSWORD is not configured"
+            exit 1
+          fi
 
           CERTIFICATE_PATH="$RUNNER_TEMP/developer-id.p12"
           KEYCHAIN_PATH="$RUNNER_TEMP/build.keychain-db"
@@ -94,6 +119,11 @@ jobs:
         run: |
           set -euo pipefail
 
+          if [[ -z "${SIGNING_IDENTITY:-}" ]]; then
+            echo "APPLE_CODESIGN_IDENTITY is not configured"
+            exit 1
+          fi
+
           BINARY="bridge/target/release/tool4d-lsp-stdio"
 
           codesign \
@@ -120,12 +150,16 @@ jobs:
           set -euo pipefail
 
           PACKAGE_DIR="$RUNNER_TEMP/tool4d-lsp-stdio"
+          ASSET="tool4d-lsp-stdio-aarch64-apple-darwin.zip"
 
+          rm -rf "$PACKAGE_DIR"
           mkdir -p "$PACKAGE_DIR"
 
           cp \
             bridge/target/release/tool4d-lsp-stdio \
             "$PACKAGE_DIR/tool4d-lsp-stdio"
+
+          chmod +x "$PACKAGE_DIR/tool4d-lsp-stdio"
 
           cp README.md "$PACKAGE_DIR/README.md"
           cp LICENSE "$PACKAGE_DIR/LICENSE"
@@ -135,23 +169,10 @@ jobs:
             -k \
             --keepParent \
             "$PACKAGE_DIR" \
-            tool4d-lsp-stdio-aarch64-apple-darwin.zip
+            "$ASSET"
 
-      - name: Prepare notarization key
-        env:
-          API_PRIVATE_KEY: ${{ secrets.APPLE_API_PRIVATE_KEY }}
-          API_KEY_ID: ${{ secrets.APPLE_API_KEY_ID }}
-        shell: bash
-        run: |
-          set -euo pipefail
-
-          API_KEY_PATH="$RUNNER_TEMP/AuthKey_${API_KEY_ID}.p8"
-
-          printf '%s' "$API_PRIVATE_KEY" > "$API_KEY_PATH"
-
-          chmod 600 "$API_KEY_PATH"
-
-          echo "APPLE_API_KEY_PATH=$API_KEY_PATH" >> "$GITHUB_ENV"
+          test -s "$ASSET"
+          unzip -l "$ASSET"
 
       - name: Notarize adapter
         env:
@@ -161,41 +182,41 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          
+
           if [[ -z "${APPLE_ID:-}" ]]; then
             echo "APPLE_ID is not configured"
             exit 1
           fi
-          
+
           if [[ -z "${APPLE_APP_SPECIFIC_PASSWORD:-}" ]]; then
             echo "APPLE_APP_SPECIFIC_PASSWORD is not configured"
             exit 1
           fi
-          
+
           if [[ -z "${APPLE_TEAM_ID:-}" ]]; then
             echo "APPLE_TEAM_ID is not configured"
             exit 1
           fi
-          
-          xcrun notarytool submit \
-          tool4d-lsp-stdio-aarch64-apple-darwin.zip \
-          --apple-id "$APPLE_ID" \
-          --password "$APPLE_APP_SPECIFIC_PASSWORD" \
-          --team-id "$APPLE_TEAM_ID" \
-          --wait
 
-      - name: Create checksum
+          xcrun notarytool submit \
+            tool4d-lsp-stdio-aarch64-apple-darwin.zip \
+            --apple-id "$APPLE_ID" \
+            --password "$APPLE_APP_SPECIFIC_PASSWORD" \
+            --team-id "$APPLE_TEAM_ID" \
+            --wait
+
+      - name: Create macOS checksum
         shell: bash
         run: |
           set -euo pipefail
 
-          shasum -a 256 \
-            tool4d-lsp-stdio-aarch64-apple-darwin.zip \
-            > tool4d-lsp-stdio-aarch64-apple-darwin.zip.sha256
+          ASSET="tool4d-lsp-stdio-aarch64-apple-darwin.zip"
 
-          cat tool4d-lsp-stdio-aarch64-apple-darwin.zip.sha256
+          shasum -a 256 "$ASSET" > "${ASSET}.sha256"
 
-      - name: Upload workflow artifacts
+          cat "${ASSET}.sha256"
+
+      - name: Upload macOS workflow artifacts
         uses: actions/upload-artifact@v4
         with:
           name: tool4d-lsp-stdio-macos
@@ -203,6 +224,198 @@ jobs:
             tool4d-lsp-stdio-aarch64-apple-darwin.zip
             tool4d-lsp-stdio-aarch64-apple-darwin.zip.sha256
           if-no-files-found: error
+          retention-days: 7
+
+  windows:
+    name: Build Windows x86-64 adapter
+    runs-on: windows-latest
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-pc-windows-msvc
+
+      - name: Build adapter
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+
+          cargo build `
+            --manifest-path bridge/Cargo.toml `
+            --locked `
+            --release `
+            --target x86_64-pc-windows-msvc
+
+      - name: Verify Windows executable
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+
+          $binary = `
+            "bridge/target/x86_64-pc-windows-msvc/release/" +
+            "tool4d-lsp-stdio.exe"
+
+          if (-not (Test-Path $binary -PathType Leaf)) {
+            throw "Windows executable was not found: $binary"
+          }
+
+          $file = Get-Item $binary
+
+          if ($file.Length -eq 0) {
+            throw "Windows executable is empty: $binary"
+          }
+
+          Write-Host "Windows executable: $($file.FullName)"
+          Write-Host "Size: $($file.Length) bytes"
+
+      - name: Package Windows adapter
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+
+          $binary = `
+            "bridge/target/x86_64-pc-windows-msvc/release/" +
+            "tool4d-lsp-stdio.exe"
+
+          $packageRoot = Join-Path `
+            $env:RUNNER_TEMP `
+            "tool4d-lsp-stdio"
+
+          $asset = `
+            "tool4d-lsp-stdio-x86_64-pc-windows-msvc.zip"
+
+          if (Test-Path $packageRoot) {
+            Remove-Item `
+              -Path $packageRoot `
+              -Recurse `
+              -Force
+          }
+
+          New-Item `
+            -ItemType Directory `
+            -Path $packageRoot `
+            -Force |
+            Out-Null
+
+          Copy-Item `
+            -Path $binary `
+            -Destination (
+              Join-Path $packageRoot "tool4d-lsp-stdio.exe"
+            )
+
+          Copy-Item `
+            -Path README.md `
+            -Destination (
+              Join-Path $packageRoot "README.md"
+            )
+
+          Copy-Item `
+            -Path LICENSE `
+            -Destination (
+              Join-Path $packageRoot "LICENSE"
+            )
+
+          Compress-Archive `
+            -Path $packageRoot `
+            -DestinationPath $asset `
+            -CompressionLevel Optimal `
+            -Force
+
+          if (-not (Test-Path $asset -PathType Leaf)) {
+            throw "Windows archive was not created: $asset"
+          }
+
+          $archive = Get-Item $asset
+
+          if ($archive.Length -eq 0) {
+            throw "Windows archive is empty: $asset"
+          }
+
+          Write-Host "Created $asset"
+          Write-Host "Size: $($archive.Length) bytes"
+
+      - name: Create Windows checksum
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+
+          $asset = `
+            "tool4d-lsp-stdio-x86_64-pc-windows-msvc.zip"
+
+          $checksum = Get-FileHash `
+            -Path $asset `
+            -Algorithm SHA256
+
+          $line = (
+            $checksum.Hash.ToLowerInvariant() +
+            "  " +
+            $asset
+          )
+
+          Set-Content `
+            -Path "${asset}.sha256" `
+            -Value $line `
+            -Encoding ascii
+
+          Get-Content "${asset}.sha256"
+
+      - name: Upload Windows workflow artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: tool4d-lsp-stdio-windows
+          path: |
+            tool4d-lsp-stdio-x86_64-pc-windows-msvc.zip
+            tool4d-lsp-stdio-x86_64-pc-windows-msvc.zip.sha256
+          if-no-files-found: error
+          retention-days: 7
+
+  publish:
+    name: Publish GitHub release
+    needs:
+      - macos
+      - windows
+    runs-on: ubuntu-latest
+
+    # Manual workflow runs build artifacts for testing but do not create a
+    # release because workflow_dispatch normally runs from a branch, not a tag.
+    if: startsWith(github.ref, 'refs/tags/')
+
+    permissions:
+      contents: write
+
+    steps:
+      - name: Download release artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: release-assets
+          merge-multiple: true
+
+      - name: List release assets
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          find release-assets \
+            -maxdepth 1 \
+            -type f \
+            -print \
+            -exec ls -lh {} \;
+
+          test -s \
+            release-assets/tool4d-lsp-stdio-aarch64-apple-darwin.zip
+
+          test -s \
+            release-assets/tool4d-lsp-stdio-aarch64-apple-darwin.zip.sha256
+
+          test -s \
+            release-assets/tool4d-lsp-stdio-x86_64-pc-windows-msvc.zip
+
+          test -s \
+            release-assets/tool4d-lsp-stdio-x86_64-pc-windows-msvc.zip.sha256
 
       - name: Create GitHub release
         env:
@@ -211,7 +424,9 @@ jobs:
         run: |
           set -euo pipefail
 
-          if ! gh release view "$GITHUB_REF_NAME" >/dev/null 2>&1; then
+          if ! gh release view "$GITHUB_REF_NAME" \
+            >/dev/null 2>&1
+          then
             gh release create "$GITHUB_REF_NAME" \
               --verify-tag \
               --generate-notes \
@@ -227,6 +442,8 @@ jobs:
 
           gh release upload \
             "$GITHUB_REF_NAME" \
-            tool4d-lsp-stdio-aarch64-apple-darwin.zip \
-            tool4d-lsp-stdio-aarch64-apple-darwin.zip.sha256 \
+            release-assets/tool4d-lsp-stdio-aarch64-apple-darwin.zip \
+            release-assets/tool4d-lsp-stdio-aarch64-apple-darwin.zip.sha256 \
+            release-assets/tool4d-lsp-stdio-x86_64-pc-windows-msvc.zip \
+            release-assets/tool4d-lsp-stdio-x86_64-pc-windows-msvc.zip.sha256 \
             --clobber
