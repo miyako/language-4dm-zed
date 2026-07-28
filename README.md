@@ -14,7 +14,7 @@ This extension provides:
 
 - Zed
 - `tool4d` 21 or later
-- macOS or Windows
+- macOS (Apple Silicon)
 
 ## Architecture
 
@@ -35,7 +35,7 @@ tool4d-lsp-stdio
        |
 tool4d --project=<project> --lsp=<port>
 
-## Adapter Download
+## Language Server 
 
 A native adapter corresponsing to the Zed platform is downloaded from GitHub assets:
 
@@ -45,6 +45,8 @@ A native adapter corresponsing to the Zed platform is downloaded from GitHub ass
 | macOS Intel | `tool4d-lsp-stdio-x86_64-apple-darwin.zip` |
 | Windows ARM64 | `tool4d-lsp-stdio-aarch64-pc-windows-msvc.zip` |
 | Windows x64 | `tool4d-lsp-stdio-x86_64-pc-windows-msvc.zip` |
+
+Restart Zed and open a 4D workspace or project that contains `.4dm` files.
 
 # Environment variables
 
