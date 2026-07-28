@@ -4,22 +4,22 @@
 
 This extension provides:
 
-- `.4dm` language recognition;
-- Tree-sitter parsing and syntax highlighting;
-- Language Server Protocol support using `tool4d`;
-- a native adapter that converts Zed's standard-input/standard-output
-  LSP transport to the TCP transport used by 4D.
+- "4D" language recognition for `.4dm` files
+- Tree-sitter parsing and syntax highlighting
+- Language Server Protocol support using `tool4d`
+- Native adapter that converts Zed's stdin/stdout LSP transport to TCP transport used by 4D
 
 ## Requirements
 
 - Zed
 - `tool4d` 21 or later
-- macOS (Apple Silicon)
+- macOS (tested on Apple Silicon)
+
+> Windows and Intel Mac support are experimental
 
 ## Architecture
 
-Zed starts language servers as subprocesses and communicates using
-standard input and output.
+Zed starts language servers as subprocesses and communicates using standard input and output.
 
 `tool4d` uses TCP and connects to the port supplied with `--lsp`.
 
@@ -34,6 +34,7 @@ tool4d-lsp-stdio
        | TCP connection to a loopback listener
        |
 tool4d --project=<project> --lsp=<port>
+```
 
 ## Language Server 
 
