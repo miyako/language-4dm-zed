@@ -171,12 +171,12 @@ fn start_socket_to_stdout(
     compatibility_state: Arc<CompatibilityState>,
 ) {
     thread::spawn(move || {
-        let result = (|| -> io::Result<()> {
+        let result = {
             let stdout = io::stdout();
             let mut stdout = stdout.lock();
-
+        
             relay_tool4d_stream(&mut socket_reader, &mut stdout, &compatibility_state)
-        })();
+        };
 
         let event = match result {
             Ok(()) => RelayEvent::SocketClosed,
