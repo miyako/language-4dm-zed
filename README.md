@@ -13,7 +13,7 @@ This extension provides:
 
 - Zed
 - `tool4d` 21 or later
-- macOS (tested on Apple Silicon)
+- macOS (tested on Apple Silicon) Windows and Intel Mac support are experimental
 
 ## Architecture
 
