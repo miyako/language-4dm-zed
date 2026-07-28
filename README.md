@@ -28,9 +28,33 @@ The native adapter connects these transports:
 ```text
 Zed stdin/stdout
        |
-       v
+       |
 tool4d-lsp-stdio
-       ^
+       |
        | TCP connection to a loopback listener
        |
 tool4d --project=<project> --lsp=<port>
+
+## Adapter Download
+
+A native adapter corresponsing to the Zed platform is downloaded from GitHub assets:
+
+| Zed platform | Asset |
+|---|---|
+| macOS ARM64 | `tool4d-lsp-stdio-aarch64-apple-darwin.zip` |
+| macOS Intel | `tool4d-lsp-stdio-x86_64-apple-darwin.zip` |
+| Windows ARM64 | `tool4d-lsp-stdio-aarch64-pc-windows-msvc.zip` |
+| Windows x64 | `tool4d-lsp-stdio-x86_64-pc-windows-msvc.zip` |
+
+# Environment variables
+
+| Variable | Default | Purpose |
+|---|---:|---|
+| `TOOL4D_PATH` | required currently | Path to `tool4d` |
+| `TOOL4D_PROJECT` | auto-discovered | Explicit `.4DProject` |
+| `TOOL4D_LSP_PORT` | OS-selected | Fixed bridge listener port |
+| `TOOL4D_STARTUP_TIMEOUT` | `30` | Connection timeout in seconds |
+| `TOOL4D_SHUTDOWN_TIMEOUT` | `5` | Graceful shutdown timeout |
+| `TOOL4D_SKIP_ONSTARTUP` | `true` | Suppress startup methods |
+| `TOOL4D_DATALESS` | `true` | Open without a data file |
+| `TOOL4D_LOG_LEVEL` | unset | Passed to `tool4d --log-level` |
