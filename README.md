@@ -4,7 +4,7 @@
 
 This extension provides:
 
-- `.4dm` language recognition
+- "4D" language recognition for `.4dm` files
 - Tree-sitter parsing and syntax highlighting
 - Language Server Protocol support using `tool4d`
 - Native adapter that converts Zed's standard-input/standard-output LSP transport to TCP transport used by 4D.
