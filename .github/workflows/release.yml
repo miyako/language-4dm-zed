@@ -10,10 +10,42 @@ permissions:
   contents: write
 
 jobs:
+  create-release:
+    name: Create GitHub release
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Create GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          if ! gh release view "$GITHUB_REF_NAME" >/dev/null 2>&1; then
+            gh release create "$GITHUB_REF_NAME" \
+              --verify-tag \
+              --generate-notes \
+              --title "$GITHUB_REF_NAME"
+          fi
+
   macos:
-    name: Build, sign, and notarize macOS adapter
+    name: Build, sign, and notarize macOS adapter (${{ matrix.target }})
     runs-on: macos-latest
     environment: release
+    needs:
+      - create-release
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: aarch64-apple-darwin
+            expected_arch: arm64
+          - target: x86_64-apple-darwin
+            expected_arch: x86_64
 
     steps:
       - name: Check out repository
@@ -21,25 +53,29 @@ jobs:
 
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
 
       - name: Build adapter
         run: |
           cargo build \
             --manifest-path bridge/Cargo.toml \
             --locked \
-            --release
+            --release \
+            --target ${{ matrix.target }}
 
-      - name: Verify runner architecture
+      - name: Verify built binary architecture
         shell: bash
         run: |
           set -euo pipefail
 
-          echo "Runner architecture: $(uname -m)"
-          file bridge/target/release/tool4d-lsp-stdio
+          BINARY="bridge/target/${{ matrix.target }}/release/tool4d-lsp-stdio"
 
-          if [[ "$(uname -m)" != "arm64" ]]; then
-            echo "This workflow currently publishes an aarch64 artifact."
-            echo "The selected runner is not arm64."
+          echo "Target: ${{ matrix.target }}"
+          file "$BINARY"
+
+          if ! file "$BINARY" | grep -q "${{ matrix.expected_arch }}"; then
+            echo "Built binary does not match expected architecture: ${{ matrix.expected_arch }}"
             exit 1
           fi
 
@@ -94,7 +130,7 @@ jobs:
         run: |
           set -euo pipefail
 
-          BINARY="bridge/target/release/tool4d-lsp-stdio"
+          BINARY="bridge/target/${{ matrix.target }}/release/tool4d-lsp-stdio"
 
           codesign \
             --force \
@@ -120,11 +156,12 @@ jobs:
           set -euo pipefail
 
           PACKAGE_DIR="$RUNNER_TEMP/tool4d-lsp-stdio"
+          ASSET="tool4d-lsp-stdio-${{ matrix.target }}.zip"
 
           mkdir -p "$PACKAGE_DIR"
 
           cp \
-            bridge/target/release/tool4d-lsp-stdio \
+            "bridge/target/${{ matrix.target }}/release/tool4d-lsp-stdio" \
             "$PACKAGE_DIR/tool4d-lsp-stdio"
 
           cp README.md "$PACKAGE_DIR/README.md"
@@ -135,7 +172,7 @@ jobs:
             -k \
             --keepParent \
             "$PACKAGE_DIR" \
-            tool4d-lsp-stdio-aarch64-apple-darwin.zip
+            "$ASSET"
 
       - name: Prepare notarization key
         env:
@@ -161,24 +198,26 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          
+
+          ASSET="tool4d-lsp-stdio-${{ matrix.target }}.zip"
+
           if [[ -z "${APPLE_ID:-}" ]]; then
             echo "APPLE_ID is not configured"
             exit 1
           fi
-          
+
           if [[ -z "${APPLE_APP_SPECIFIC_PASSWORD:-}" ]]; then
             echo "APPLE_APP_SPECIFIC_PASSWORD is not configured"
             exit 1
           fi
-          
+
           if [[ -z "${APPLE_TEAM_ID:-}" ]]; then
             echo "APPLE_TEAM_ID is not configured"
             exit 1
           fi
-          
+
           xcrun notarytool submit \
-          tool4d-lsp-stdio-aarch64-apple-darwin.zip \
+          "$ASSET" \
           --apple-id "$APPLE_ID" \
           --password "$APPLE_APP_SPECIFIC_PASSWORD" \
           --team-id "$APPLE_TEAM_ID" \
@@ -189,34 +228,20 @@ jobs:
         run: |
           set -euo pipefail
 
-          shasum -a 256 \
-            tool4d-lsp-stdio-aarch64-apple-darwin.zip \
-            > tool4d-lsp-stdio-aarch64-apple-darwin.zip.sha256
+          ASSET="tool4d-lsp-stdio-${{ matrix.target }}.zip"
 
-          cat tool4d-lsp-stdio-aarch64-apple-darwin.zip.sha256
+          shasum -a 256 "$ASSET" > "${ASSET}.sha256"
+
+          cat "${ASSET}.sha256"
 
       - name: Upload workflow artifacts
         uses: actions/upload-artifact@v4
         with:
-          name: tool4d-lsp-stdio-macos
+          name: tool4d-lsp-stdio-${{ matrix.target }}
           path: |
-            tool4d-lsp-stdio-aarch64-apple-darwin.zip
-            tool4d-lsp-stdio-aarch64-apple-darwin.zip.sha256
+            tool4d-lsp-stdio-${{ matrix.target }}.zip
+            tool4d-lsp-stdio-${{ matrix.target }}.zip.sha256
           if-no-files-found: error
-
-      - name: Create GitHub release
-        env:
-          GH_TOKEN: ${{ github.token }}
-        shell: bash
-        run: |
-          set -euo pipefail
-
-          if ! gh release view "$GITHUB_REF_NAME" >/dev/null 2>&1; then
-            gh release create "$GITHUB_REF_NAME" \
-              --verify-tag \
-              --generate-notes \
-              --title "$GITHUB_REF_NAME"
-          fi
 
       - name: Publish GitHub release assets
         env:
@@ -225,17 +250,25 @@ jobs:
         run: |
           set -euo pipefail
 
+          ASSET="tool4d-lsp-stdio-${{ matrix.target }}.zip"
+
           gh release upload \
             "$GITHUB_REF_NAME" \
-            tool4d-lsp-stdio-aarch64-apple-darwin.zip \
-            tool4d-lsp-stdio-aarch64-apple-darwin.zip.sha256 \
+            "$ASSET" \
+            "${ASSET}.sha256" \
             --clobber
 
   windows:
-    name: Build and package Windows adapter
+    name: Build and package Windows adapter (${{ matrix.target }})
     runs-on: windows-latest
     needs:
-      - macos
+      - create-release
+    strategy:
+      fail-fast: false
+      matrix:
+        target:
+          - x86_64-pc-windows-msvc
+          - aarch64-pc-windows-msvc
 
     steps:
       - name: Check out repository
@@ -244,7 +277,7 @@ jobs:
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
         with:
-          targets: x86_64-pc-windows-msvc
+          targets: ${{ matrix.target }}
 
       - name: Build adapter
         shell: pwsh
@@ -255,7 +288,7 @@ jobs:
             --manifest-path bridge/Cargo.toml `
             --locked `
             --release `
-            --target x86_64-pc-windows-msvc
+            --target ${{ matrix.target }}
 
       - name: Verify Windows executable
         shell: pwsh
@@ -263,7 +296,7 @@ jobs:
           $ErrorActionPreference = "Stop"
 
           $binary = Join-Path `
-            "bridge/target/x86_64-pc-windows-msvc/release" `
+            "bridge/target/${{ matrix.target }}/release" `
             "tool4d-lsp-stdio.exe"
 
           if (-not (Test-Path $binary -PathType Leaf)) {
@@ -285,7 +318,7 @@ jobs:
           $ErrorActionPreference = "Stop"
 
           $binary = Join-Path `
-            "bridge/target/x86_64-pc-windows-msvc/release" `
+            "bridge/target/${{ matrix.target }}/release" `
             "tool4d-lsp-stdio.exe"
 
           $packageDir = Join-Path `
@@ -293,7 +326,7 @@ jobs:
             "tool4d-lsp-stdio"
 
           $asset = `
-            "tool4d-lsp-stdio-x86_64-pc-windows-msvc.zip"
+            "tool4d-lsp-stdio-${{ matrix.target }}.zip"
 
           if (Test-Path $packageDir) {
             Remove-Item `
@@ -351,7 +384,7 @@ jobs:
           $ErrorActionPreference = "Stop"
 
           $asset = `
-            "tool4d-lsp-stdio-x86_64-pc-windows-msvc.zip"
+            "tool4d-lsp-stdio-${{ matrix.target }}.zip"
 
           $hash = Get-FileHash `
             -Path $asset `
@@ -373,10 +406,10 @@ jobs:
       - name: Upload workflow artifacts
         uses: actions/upload-artifact@v4
         with:
-          name: tool4d-lsp-stdio-windows
+          name: tool4d-lsp-stdio-${{ matrix.target }}
           path: |
-            tool4d-lsp-stdio-x86_64-pc-windows-msvc.zip
-            tool4d-lsp-stdio-x86_64-pc-windows-msvc.zip.sha256
+            tool4d-lsp-stdio-${{ matrix.target }}.zip
+            tool4d-lsp-stdio-${{ matrix.target }}.zip.sha256
           if-no-files-found: error
 
       - name: Publish GitHub release assets
@@ -388,6 +421,6 @@ jobs:
 
           gh release upload `
             $env:GITHUB_REF_NAME `
-            "tool4d-lsp-stdio-x86_64-pc-windows-msvc.zip" `
-            "tool4d-lsp-stdio-x86_64-pc-windows-msvc.zip.sha256" `
+            "tool4d-lsp-stdio-${{ matrix.target }}.zip" `
+            "tool4d-lsp-stdio-${{ matrix.target }}.zip.sha256" `
             --clobber
