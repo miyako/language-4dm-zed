@@ -13,7 +13,7 @@ This extension provides:
 ## Requirements
 
 - Zed
-- 4D or `tool4d` 21 or later
+- `tool4d` 21 or later
 - macOS or Windows
 
 ## Architecture
