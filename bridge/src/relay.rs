@@ -3,13 +3,13 @@ use std::{
     io::{self, Read, Write},
     net::{Shutdown, TcpStream},
     sync::{
-        mpsc::{self, Receiver, Sender},
         Arc, Mutex, MutexGuard,
+        mpsc::{self, Receiver, Sender},
     },
     thread,
 };
 
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
 const MAX_LSP_HEADER_SIZE: usize = 64 * 1024;
 const MAX_LSP_BODY_SIZE: usize = 256 * 1024 * 1024;
@@ -33,13 +33,9 @@ enum RequestId {
 impl RequestId {
     fn from_json(value: &Value) -> Option<Self> {
         match value {
-            Value::Number(number) => {
-                Some(Self::Number(number.to_string()))
-            }
+            Value::Number(number) => Some(Self::Number(number.to_string())),
 
-            Value::String(value) => {
-                Some(Self::String(value.clone()))
-            }
+            Value::String(value) => Some(Self::String(value.clone())),
 
             _ => None,
         }
@@ -85,8 +81,7 @@ impl Relay {
         let socket_writer = stream.try_clone()?;
         let control_stream = stream;
 
-        let compatibility_state =
-            Arc::new(CompatibilityState::default());
+        let compatibility_state = Arc::new(CompatibilityState::default());
 
         let (event_sender, event_receiver) = mpsc::channel();
 
@@ -96,11 +91,7 @@ impl Relay {
             Arc::clone(&compatibility_state),
         );
 
-        start_socket_to_stdout(
-            socket_reader,
-            event_sender,
-            compatibility_state,
-        );
+        start_socket_to_stdout(socket_reader, event_sender, compatibility_state);
 
         Ok(Self {
             control_stream,
@@ -121,8 +112,7 @@ impl Relay {
             Err(error)
                 if matches!(
                     error.kind(),
-                    io::ErrorKind::NotConnected
-                        | io::ErrorKind::BrokenPipe
+                    io::ErrorKind::NotConnected | io::ErrorKind::BrokenPipe
                 ) => {}
 
             Err(error) => {
@@ -145,11 +135,7 @@ fn start_stdin_to_socket(
             let stdin = io::stdin();
             let mut stdin = stdin.lock();
 
-            relay_editor_stream(
-                &mut stdin,
-                &mut socket_writer,
-                &compatibility_state,
-            )?;
+            relay_editor_stream(&mut stdin, &mut socket_writer, &compatibility_state)?;
 
             match socket_writer.shutdown(Shutdown::Write) {
                 Ok(()) => {}
@@ -157,8 +143,7 @@ fn start_stdin_to_socket(
                 Err(error)
                     if matches!(
                         error.kind(),
-                        io::ErrorKind::NotConnected
-                            | io::ErrorKind::BrokenPipe
+                        io::ErrorKind::NotConnected | io::ErrorKind::BrokenPipe
                     ) => {}
 
                 Err(error) => return Err(error),
@@ -190,11 +175,7 @@ fn start_socket_to_stdout(
             let stdout = io::stdout();
             let mut stdout = stdout.lock();
 
-            relay_tool4d_stream(
-                &mut socket_reader,
-                &mut stdout,
-                &compatibility_state,
-            )
+            relay_tool4d_stream(&mut socket_reader, &mut stdout, &compatibility_state)
         })();
 
         let event = match result {
@@ -256,10 +237,7 @@ where
 /// Reads LSP frames and writes them with canonical `Content-Length` headers.
 ///
 /// This function does not inspect or modify JSON-RPC bodies.
-pub fn normalize_lsp_stream<R, W>(
-    mut input: R,
-    mut output: W,
-) -> io::Result<()>
+pub fn normalize_lsp_stream<R, W>(mut input: R, mut output: W) -> io::Result<()>
 where
     R: Read,
     W: Write,
@@ -276,9 +254,7 @@ struct LspFrame {
     body: Vec<u8>,
 }
 
-fn read_lsp_frame<R>(
-    input: &mut R,
-) -> io::Result<Option<LspFrame>>
+fn read_lsp_frame<R>(input: &mut R) -> io::Result<Option<LspFrame>>
 where
     R: Read,
 {
@@ -291,8 +267,7 @@ where
     if parsed_header.content_length > MAX_LSP_BODY_SIZE {
         return Err(invalid_data(format!(
             "LSP body length {} exceeds the maximum of {} bytes",
-            parsed_header.content_length,
-            MAX_LSP_BODY_SIZE
+            parsed_header.content_length, MAX_LSP_BODY_SIZE
         )));
     }
 
@@ -318,18 +293,11 @@ where
     }))
 }
 
-fn write_lsp_frame<W>(
-    output: &mut W,
-    frame: &LspFrame,
-) -> io::Result<()>
+fn write_lsp_frame<W>(output: &mut W, frame: &LspFrame) -> io::Result<()>
 where
     W: Write,
 {
-    write!(
-        output,
-        "Content-Length: {}\r\n",
-        frame.body.len()
-    )?;
+    write!(output, "Content-Length: {}\r\n", frame.body.len())?;
 
     for header in &frame.additional_headers {
         output.write_all(header)?;
@@ -341,10 +309,7 @@ where
     output.flush()
 }
 
-fn remember_diagnostic_request(
-    body: &[u8],
-    state: &CompatibilityState,
-) -> io::Result<()> {
+fn remember_diagnostic_request(body: &[u8], state: &CompatibilityState) -> io::Result<()> {
     let Ok(message) = serde_json::from_slice::<Value>(body) else {
         /*
          * Framing remains transparent for non-JSON or malformed payloads.
@@ -353,18 +318,11 @@ fn remember_diagnostic_request(
         return Ok(());
     };
 
-    if message
-        .get("method")
-        .and_then(Value::as_str)
-        != Some("textDocument/diagnostic")
-    {
+    if message.get("method").and_then(Value::as_str) != Some("textDocument/diagnostic") {
         return Ok(());
     }
 
-    let Some(request_id) = message
-        .get("id")
-        .and_then(RequestId::from_json)
-    else {
+    let Some(request_id) = message.get("id").and_then(RequestId::from_json) else {
         /*
          * A JSON-RPC notification has no response and therefore must not be
          * added to the pending request set.
@@ -381,15 +339,11 @@ fn rewrite_null_diagnostic_response(
     body: &mut Vec<u8>,
     state: &CompatibilityState,
 ) -> io::Result<()> {
-    let Ok(mut message) = serde_json::from_slice::<Value>(body.as_slice())
-    else {
+    let Ok(mut message) = serde_json::from_slice::<Value>(body.as_slice()) else {
         return Ok(());
     };
 
-    let Some(request_id) = message
-        .get("id")
-        .and_then(RequestId::from_json)
-    else {
+    let Some(request_id) = message.get("id").and_then(RequestId::from_json) else {
         return Ok(());
     };
 
@@ -397,8 +351,7 @@ fn rewrite_null_diagnostic_response(
      * Consume the pending ID as soon as any matching response arrives.
      * This includes valid reports and JSON-RPC error responses.
      */
-    let is_diagnostic_response =
-        lock_pending_diagnostics(state)?.remove(&request_id);
+    let is_diagnostic_response = lock_pending_diagnostics(state)?.remove(&request_id);
 
     if !is_diagnostic_response {
         return Ok(());
@@ -439,11 +392,7 @@ fn lock_pending_diagnostics(
     state
         .pending_diagnostic_requests
         .lock()
-        .map_err(|_| {
-            io::Error::other(
-                "pending diagnostic request state is poisoned",
-            )
-        })
+        .map_err(|_| io::Error::other("pending diagnostic request state is poisoned"))
 }
 
 struct ParsedHeader {
@@ -454,9 +403,7 @@ struct ParsedHeader {
 /// Reads one LSP header block, excluding the final CRLF-CRLF delimiter.
 ///
 /// `Ok(None)` means the stream reached EOF before another frame started.
-fn read_lsp_header<R>(
-    input: &mut R,
-) -> io::Result<Option<Vec<u8>>>
+fn read_lsp_header<R>(input: &mut R) -> io::Result<Option<Vec<u8>>>
 where
     R: Read,
 {
@@ -487,17 +434,13 @@ where
                 }
 
                 if header.ends_with(HEADER_END) {
-                    header.truncate(
-                        header.len() - HEADER_END.len(),
-                    );
+                    header.truncate(header.len() - HEADER_END.len());
 
                     return Ok(Some(header));
                 }
             }
 
-            Err(error)
-                if error.kind() == io::ErrorKind::Interrupted =>
-            {
+            Err(error) if error.kind() == io::ErrorKind::Interrupted => {
                 continue;
             }
 
@@ -506,9 +449,7 @@ where
     }
 }
 
-fn parse_lsp_header(
-    header: &[u8],
-) -> io::Result<ParsedHeader> {
+fn parse_lsp_header(header: &[u8]) -> io::Result<ParsedHeader> {
     if header.is_empty() {
         return Err(invalid_data("empty LSP header"));
     }
@@ -519,34 +460,23 @@ fn parse_lsp_header(
 
     loop {
         let (line, rest) = match find_crlf(remaining) {
-            Some(position) => (
-                &remaining[..position],
-                Some(&remaining[position + 2..]),
-            ),
+            Some(position) => (&remaining[..position], Some(&remaining[position + 2..])),
 
             None => (remaining, None),
         };
 
         if line.is_empty() {
-            return Err(invalid_data(
-                "unexpected empty line inside LSP header",
-            ));
+            return Err(invalid_data("unexpected empty line inside LSP header"));
         }
 
-        parse_lsp_header_line(
-            line,
-            &mut content_length,
-            &mut additional_headers,
-        )?;
+        parse_lsp_header_line(line, &mut content_length, &mut additional_headers)?;
 
         match rest {
             Some(rest) => {
                 remaining = rest;
 
                 if remaining.is_empty() {
-                    return Err(invalid_data(
-                        "unexpected empty line inside LSP header",
-                    ));
+                    return Err(invalid_data("unexpected empty line inside LSP header"));
                 }
             }
 
@@ -554,10 +484,8 @@ fn parse_lsp_header(
         }
     }
 
-    let content_length = content_length
-        .ok_or_else(|| {
-            invalid_data("missing Content-Length header")
-        })?;
+    let content_length =
+        content_length.ok_or_else(|| invalid_data("missing Content-Length header"))?;
 
     Ok(ParsedHeader {
         content_length,
@@ -566,9 +494,7 @@ fn parse_lsp_header(
 }
 
 fn find_crlf(value: &[u8]) -> Option<usize> {
-    value
-        .windows(2)
-        .position(|window| window == b"\r\n")
+    value.windows(2).position(|window| window == b"\r\n")
 }
 
 fn parse_lsp_header_line(
@@ -577,23 +503,17 @@ fn parse_lsp_header_line(
     additional_headers: &mut Vec<Vec<u8>>,
 ) -> io::Result<()> {
     if line.contains(&b'\r') || line.contains(&b'\n') {
-        return Err(invalid_data(
-            "LSP header lines must be separated by CRLF",
-        ));
+        return Err(invalid_data("LSP header lines must be separated by CRLF"));
     }
 
     let colon_position = line
         .iter()
         .position(|byte| *byte == b':')
-        .ok_or_else(|| {
-            invalid_data("LSP header line has no colon")
-        })?;
+        .ok_or_else(|| invalid_data("LSP header line has no colon"))?;
 
-    let name =
-        trim_ascii_whitespace(&line[..colon_position]);
+    let name = trim_ascii_whitespace(&line[..colon_position]);
 
-    let value =
-        trim_ascii_whitespace(&line[colon_position + 1..]);
+    let value = trim_ascii_whitespace(&line[colon_position + 1..]);
 
     if name.is_empty() {
         return Err(invalid_data("LSP header name is empty"));
@@ -601,30 +521,19 @@ fn parse_lsp_header_line(
 
     if name.eq_ignore_ascii_case(b"Content-Length") {
         if content_length.is_some() {
-            return Err(invalid_data(
-                "duplicate Content-Length header",
-            ));
+            return Err(invalid_data("duplicate Content-Length header"));
         }
 
-        let value = std::str::from_utf8(value).map_err(|_| {
-            invalid_data(
-                "Content-Length contains non-UTF-8 bytes",
-            )
-        })?;
+        let value = std::str::from_utf8(value)
+            .map_err(|_| invalid_data("Content-Length contains non-UTF-8 bytes"))?;
 
-        if value.is_empty()
-            || !value
-                .bytes()
-                .all(|byte| byte.is_ascii_digit())
-        {
-            return Err(invalid_data(
-                "Content-Length is not a decimal integer",
-            ));
+        if value.is_empty() || !value.bytes().all(|byte| byte.is_ascii_digit()) {
+            return Err(invalid_data("Content-Length is not a decimal integer"));
         }
 
-        let length = value.parse::<usize>().map_err(|_| {
-            invalid_data("Content-Length is out of range")
-        })?;
+        let length = value
+            .parse::<usize>()
+            .map_err(|_| invalid_data("Content-Length is out of range"))?;
 
         *content_length = Some(length);
     } else {
@@ -635,41 +544,26 @@ fn parse_lsp_header_line(
 }
 
 fn trim_ascii_whitespace(mut value: &[u8]) -> &[u8] {
-    while value
-        .first()
-        .is_some_and(|byte| byte.is_ascii_whitespace())
-    {
+    while value.first().is_some_and(|byte| byte.is_ascii_whitespace()) {
         value = &value[1..];
     }
 
-    while value
-        .last()
-        .is_some_and(|byte| byte.is_ascii_whitespace())
-    {
+    while value.last().is_some_and(|byte| byte.is_ascii_whitespace()) {
         value = &value[..value.len() - 1];
     }
 
     value
 }
 
-fn invalid_data(
-    message: impl Into<String>,
-) -> io::Error {
-    io::Error::new(
-        io::ErrorKind::InvalidData,
-        message.into(),
-    )
+fn invalid_data(message: impl Into<String>) -> io::Error {
+    io::Error::new(io::ErrorKind::InvalidData, message.into())
 }
 
 /// Relays arbitrary input and output streams to a TCP connection.
 ///
 /// This generic helper retains raw byte-relay behavior. Production tool4d
 /// sessions use `Relay`, which applies LSP framing and compatibility handling.
-pub fn streams_to_tcp<R, W>(
-    mut input: R,
-    mut output: W,
-    stream: TcpStream,
-) -> io::Result<()>
+pub fn streams_to_tcp<R, W>(mut input: R, mut output: W, stream: TcpStream) -> io::Result<()>
 where
     R: Read + Send + 'static,
     W: Write,
