@@ -174,7 +174,7 @@ fn start_socket_to_stdout(
         let result = {
             let stdout = io::stdout();
             let mut stdout = stdout.lock();
-        
+
             relay_tool4d_stream(&mut socket_reader, &mut stdout, &compatibility_state)
         };
 
