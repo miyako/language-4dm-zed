@@ -14,14 +14,6 @@ jobs:
   extension:
     name: Zed extension
     runs-on: macos-latest
-    # Pull requests opened by a workflow -- the grammar pin bump -- carry a head
-    # branch pushed with GITHUB_TOKEN, and GitHub refuses to run workflows for
-    # those. The run still appears, with zero jobs and a red cross: it reads
-    # like a failing check and is a refusal. `update-grammar.yml` already builds
-    # the extension against the new revision before it opens the pull request,
-    # and `main` is checked when the merge lands.
-    if: github.actor != 'github-actions[bot]'
-
     steps:
       - name: Check out repository
         uses: actions/checkout@v4
@@ -57,7 +49,6 @@ jobs:
     # like a failing check and is a refusal. `update-grammar.yml` already builds
     # the extension against the new revision before it opens the pull request,
     # and `main` is checked when the merge lands.
-    if: github.actor != 'github-actions[bot]'
     strategy:
       fail-fast: false
       matrix:
@@ -122,7 +113,6 @@ jobs:
     # like a failing check and is a refusal. `update-grammar.yml` already builds
     # the extension against the new revision before it opens the pull request,
     # and `main` is checked when the merge lands.
-    if: github.actor != 'github-actions[bot]'
     
     steps:
       - name: Check out repository
