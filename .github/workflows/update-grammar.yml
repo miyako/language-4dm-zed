@@ -178,6 +178,16 @@ jobs:
           git add "$MANIFEST"
           git commit -m "Pin grammar to ${rev:0:12}"
           git fetch --quiet origin "$BRANCH" || true
+          # This push uses GITHUB_TOKEN, and GitHub does not run workflows for
+          # events that token causes. For the pull_request event it still
+          # creates a run, with zero jobs, that is recorded as failed -- "This
+          # run likely failed because of a workflow file issue". It is not a
+          # check: no check run is attached to the commit, `gh pr checks` says
+          # "no checks reported", and re-running it reproduces the same run.
+          # Nothing can be done about it here; the pull request is already
+          # verified by this workflow, which builds the extension against the
+          # new revision before opening it, and `main` is checked when the merge
+          # lands. A token of its own would make CI run on the branch for real.
           git push --force-with-lease origin "$BRANCH"
 
           body=$(mktemp)
