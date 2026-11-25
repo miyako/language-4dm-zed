@@ -1,0 +1,210 @@
+name: Update grammar revision
+
+# Moves the grammar this extension pins -- `rev` under [grammars.fourd] in
+# extension.toml -- to a commit in miyako/tree-sitter-fourd, and opens a pull
+# request when the pin moves.
+#
+# Why a pin at all: Zed builds the grammar from the repository at the recorded
+# `rev` and embeds the resulting wasm in the extension. The extension registry
+# requires a full commit SHA there, so the pin is the only thing that decides
+# which parser ships.
+#
+# Why this workflow and not the grammar repository: the grammar repository
+# already regenerates its own src/ (update-builtins.yml, regenerate-parser.yml)
+# and merges that with review. What it cannot know is which parser release of
+# this extension wants to adopt -- that is a decision made here, by merging a
+# pin bump. Two repositories, two runners, no cross-repository tokens.
+#
+# The bump is verified before the PR is opened:
+#   * the commit exists and carries src/parser.c (a grammar, not an empty tree);
+#   * that parser.c and src/scanner.c compile at that commit;
+#   * this extension still builds for wasm32-wasip1 against the pinned rev.
+
+on:
+  workflow_dispatch:
+    inputs:
+      rev:
+        description: 'Commit SHA in miyako/tree-sitter-fourd. Empty means the tip of its default branch.'
+        required: false
+        default: ''
+  schedule:
+    # Weekly. The grammar repository regenerates on its own schedule; this
+    # catches whatever it has merged since.
+    - cron: '0 4 * * 1'
+
+permissions:
+  contents: write
+  pull-requests: write
+
+concurrency:
+  group: update-grammar
+  cancel-in-progress: false
+
+env:
+  GH_TOKEN: ${{ github.token }}
+  GRAMMAR_REPOSITORY: https://github.com/miyako/tree-sitter-fourd
+  MANIFEST: extension.toml
+  BRANCH: ci/update-grammar-rev
+
+jobs:
+  bump:
+    name: Pin the grammar revision
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Resolve the grammar revision
+        id: rev
+        # Values reach the script through the environment: GitHub expands
+        # ${{ }} into the script text, so a value is code as well as data.
+        env:
+          REQUESTED: ${{ inputs.rev }}
+        run: |
+          set -euo pipefail
+
+          requested="${REQUESTED:-}"
+          if [ -n "$requested" ]; then
+            if ! printf '%s' "$requested" | grep -Eq '^[0-9a-f]{40}$'; then
+              echo "::error::'$requested' is not a full 40-character commit SHA; the extension registry requires one"
+              exit 1
+            fi
+            rev="$requested"
+          else
+            rev=$(git ls-remote "$GRAMMAR_REPOSITORY" HEAD | awk '{print $1}')
+            test -n "$rev" || { echo "::error::could not resolve $GRAMMAR_REPOSITORY HEAD"; exit 1; }
+          fi
+
+          # The pin as committed. Read with the same pattern the update writes,
+          # so the comparison cannot disagree with the edit.
+          python3 - <<'PY' > "$RUNNER_TEMP/current-rev"
+          import pathlib, re
+
+          text = pathlib.Path("extension.toml").read_text()
+          match = re.search(r'\[grammars\.fourd\][^\[]*?\brev\s*=\s*"([0-9a-fA-F]+)"', text, re.S)
+          if not match:
+              raise SystemExit("extension.toml has no rev under [grammars.fourd]")
+          print(match.group(1))
+          PY
+          current=$(cat "$RUNNER_TEMP/current-rev")
+
+          echo "current=$current"
+          echo "rev=$rev"
+          echo "new=$([ "$current" != "$rev" ] && echo true || echo false)" >> "$GITHUB_OUTPUT"
+          echo "rev=$rev" >> "$GITHUB_OUTPUT"
+          echo "current=$current" >> "$GITHUB_OUTPUT"
+          if [ "$current" = "$rev" ]; then
+            echo "::notice::the pin already names $rev"
+          fi
+
+      - name: Verify the commit is a usable grammar
+        if: steps.rev.outputs.new == 'true'
+        env:
+          REV: ${{ steps.rev.outputs.rev }}
+        run: |
+          set -euo pipefail
+
+          rev="$REV"
+          clone="$RUNNER_TEMP/grammar"
+          # A pinned SHA may be anywhere in history, so fetch it by name rather
+          # than relying on a shallow tip.
+          git init -q "$clone"
+          git -C "$clone" remote add origin "$GRAMMAR_REPOSITORY"
+          git -C "$clone" fetch -q --depth 1 origin "$rev"
+          git -C "$clone" checkout -q FETCH_HEAD
+
+          for file in src/parser.c src/scanner.c src/builtins.h src/tree_sitter/parser.h; do
+            test -s "$clone/$file" || {
+              echo "::error::$rev does not carry $file; it is not a generated tree-sitter grammar"
+              find "$clone" -maxdepth 2 -type f | head -20
+              exit 1
+            }
+          done
+
+          cc -std=c11 -fsyntax-only -I"$clone/src" "$clone/src/parser.c"
+          cc -std=c11 -fsyntax-only -I"$clone/src" "$clone/src/scanner.c"
+          echo "parser.c and scanner.c compile at $rev"
+
+      - name: Verify the extension still builds
+        if: steps.rev.outputs.new == 'true'
+        run: |
+          set -euo pipefail
+          rustup target add wasm32-wasip1
+          cargo build --locked --release --target wasm32-wasip1
+          test -s target/wasm32-wasip1/release/language_4dm_zed.wasm || {
+            echo "::error::the extension did not produce a wasm module"
+            find target/wasm32-wasip1 -name '*.wasm' | head
+            exit 1
+          }
+
+      - name: Write the new pin
+        if: steps.rev.outputs.new == 'true'
+        env:
+          REV: ${{ steps.rev.outputs.rev }}
+        run: |
+          set -euo pipefail
+          python3 - "$REV" <<'PY'
+          import re, sys, pathlib
+
+          rev = sys.argv[1]
+          path = pathlib.Path("extension.toml")
+          text = path.read_text()
+          # Anchored on the grammar's own table so a `rev` that belongs to some
+          # other section is never the one rewritten.
+          pattern = re.compile(r'(\[grammars\.fourd\][^\[]*?\brev\s*=\s*")[0-9a-fA-F]+(")', re.S)
+          updated, count = pattern.subn(rf"\g<1>{rev}\g<2>", text, count=1)
+          if count != 1:
+              sys.exit("extension.toml no longer has a rev under [grammars.fourd]; update this workflow")
+          path.write_text(updated)
+          PY
+          git diff -- "$MANIFEST"
+
+      - name: Open pull request
+        if: steps.rev.outputs.new == 'true'
+        env:
+          CURRENT: ${{ steps.rev.outputs.current }}
+          REV: ${{ steps.rev.outputs.rev }}
+          BASE_BRANCH: ${{ github.event.repository.default_branch }}
+        run: |
+          set -euo pipefail
+
+          current="$CURRENT"
+          rev="$REV"
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git checkout -B "$BRANCH"
+          git add "$MANIFEST"
+          git commit -m "Pin grammar to ${rev:0:12}"
+          git fetch --quiet origin "$BRANCH" || true
+          git push --force-with-lease origin "$BRANCH"
+
+          body=$(mktemp)
+          {
+            echo "Moves the grammar pin in \`$MANIFEST\` from \`${current:0:12}\` to \`${rev:0:12}\`."
+            echo
+            echo "Compare: $GRAMMAR_REPOSITORY/compare/${current}...${rev}"
+            echo
+            echo "Verified before this PR was opened: the commit carries a generated grammar,"
+            echo "its \`parser.c\` and \`scanner.c\` compile, and this extension builds for"
+            echo "\`wasm32-wasip1\` against it."
+            echo
+            echo "Not verified here: that the highlighting queries in \`languages/4d/\` still"
+            echo 'match the parser'"'"'s node names. Zed reports a bad query when the extension is'
+            echo 'installed; check the grammar'"'"'s `src/node-types.json` for the names the queries'
+            echo 'reference before merging.'
+          } > "$body"
+
+          # Captured rather than piped into `grep -q`, which can close the pipe
+          # under `set -o pipefail` and fail the step on a successful lookup.
+          existing=$(gh pr list --head "$BRANCH" --state open --json number --jq 'length')
+          if [ "$existing" != "0" ]; then
+            gh pr edit "$BRANCH" --title "Pin grammar to ${rev:0:12}" --body-file "$body"
+          else
+            gh pr create \
+              --head "$BRANCH" \
+              --base "$BASE_BRANCH" \
+              --title "Pin grammar to ${rev:0:12}" \
+              --body-file "$body"
+          fi
