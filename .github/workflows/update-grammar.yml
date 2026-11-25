@@ -100,8 +100,10 @@ jobs:
           fi
 
       - name: Verify the commit is a usable grammar
+        id: verify
         if: steps.rev.outputs.new == 'true'
         env:
+          CURRENT: ${{ steps.rev.outputs.current }}
           REV: ${{ steps.rev.outputs.rev }}
         run: |
           set -euo pipefail
@@ -126,6 +128,37 @@ jobs:
           cc -std=c11 -fsyntax-only -I"$clone/src" "$clone/src/parser.c"
           cc -std=c11 -fsyntax-only -I"$clone/src" "$clone/src/scanner.c"
           echo "parser.c and scanner.c compile at $rev"
+
+          # Whether the parser itself moved decides whether this bump is worth a
+          # version. src/ holds the generated artefacts and the scanner; a commit
+          # that only touches docs, CI or the corpus leaves it identical, and a
+          # version bump for that would publish a release with nothing in it.
+          #
+          # The exit status is read rather than relied on: `git diff --quiet`
+          # returns 1 for "differs" and 128 for "cannot compare", and an `if` on
+          # its status would read a broken fetch as "the parser changed".
+          git -C "$clone" fetch -q --depth 1 origin "$CURRENT" 2>/dev/null || true
+          status=0
+          git -C "$clone" diff --quiet "$CURRENT" "$rev" -- src/ || status=$?
+          case "$status" in
+            0)
+              echo "parser=false" >> "$GITHUB_OUTPUT"
+              echo "src/ is identical between ${CURRENT:0:12} and ${rev:0:12}: pin-only bump"
+              ;;
+            1)
+              echo "parser=true" >> "$GITHUB_OUTPUT"
+              git -C "$clone" diff --stat "$CURRENT" "$rev" -- src/
+              ;;
+            *)
+              # Comparison impossible, most likely because the pinned revision is
+              # no longer reachable upstream. Treat the bump as one that changes
+              # the parser -- a version that moves without need costs a patch
+              # number, a parser that ships without a version is invisible -- and
+              # say so, rather than deciding quietly.
+              echo "parser=true" >> "$GITHUB_OUTPUT"
+              echo "::warning::could not compare src/ between ${CURRENT:0:12} and ${rev:0:12} (git diff exit $status); assuming the parser changed"
+              ;;
+          esac
 
       - name: Verify the extension still builds
         if: steps.rev.outputs.new == 'true'
@@ -161,22 +194,62 @@ jobs:
           PY
           git diff -- "$MANIFEST"
 
+      - name: Bump the version when the parser changed
+        id: version
+        if: steps.rev.outputs.new == 'true' && steps.verify.outputs.parser == 'true'
+        env:
+          REV: ${{ steps.rev.outputs.rev }}
+        run: |
+          set -euo pipefail
+
+          python3 - "$REV" <<'PY' > "$RUNNER_TEMP/version"
+          import re, sys, pathlib
+
+          rev = sys.argv[1]
+          path = pathlib.Path("extension.toml")
+          text = path.read_text()
+          # A patch bump: the extension's own surface -- the queries, the bridge,
+          # the language server -- is untouched; what changes is the parser it
+          # ships.
+          pattern = re.compile(r'^version\s*=\s*"(\d+)\.(\d+)\.(\d+)"', re.M)
+          match = pattern.search(text)
+          if not match:
+              sys.exit("extension.toml has no version line; update this workflow")
+          major, minor, patch = (int(part) for part in match.groups())
+          bumped = f"{major}.{minor}.{patch + 1}"
+          text = text[: match.start()] + f'version = "{bumped}"' + text[match.end():]
+          path.write_text(text)
+          print(bumped)
+          PY
+          version=$(cat "$RUNNER_TEMP/version")
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "src/ changed at $REV, so the version moves to $version"
+          git diff -- "$MANIFEST"
+
       - name: Open pull request
         if: steps.rev.outputs.new == 'true'
         env:
           CURRENT: ${{ steps.rev.outputs.current }}
           REV: ${{ steps.rev.outputs.rev }}
+          VERSION: ${{ steps.version.outputs.version }}
           BASE_BRANCH: ${{ github.event.repository.default_branch }}
         run: |
           set -euo pipefail
 
           current="$CURRENT"
           rev="$REV"
+          version="${VERSION:-}"
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           git checkout -B "$BRANCH"
           git add "$MANIFEST"
-          git commit -m "Pin grammar to ${rev:0:12}"
+          if [ -n "$version" ]; then
+            git commit -m "Pin grammar to ${rev:0:12}, version $version"
+            title="Pin grammar to ${rev:0:12}, version $version"
+          else
+            git commit -m "Pin grammar to ${rev:0:12}"
+            title="Pin grammar to ${rev:0:12}"
+          fi
           git fetch --quiet origin "$BRANCH" || true
           # This push uses GITHUB_TOKEN, and GitHub does not run workflows for
           # events that token causes. For the pull_request event it still
@@ -204,17 +277,28 @@ jobs:
             echo 'match the parser'"'"'s node names. Zed reports a bad query when the extension is'
             echo 'installed; check the grammar'"'"'s `src/node-types.json` for the names the queries'
             echo 'reference before merging.'
+            echo
+            if [ -n "$version" ]; then
+              echo "The parser changed, so \`version\` moves to \`$version\` in the same commit."
+              echo "Merging this repo publishes nothing by itself: for the registry,"
+              echo "\`zed-industries/extensions\` then needs this repository's submodule moved to"
+              echo "the merge commit and its \`[fourd]\` version set to \`$version\`, in one update PR."
+            else
+              echo "\`src/\` is byte-identical between the two revisions, so \`version\` is left"
+              echo "alone and this is a pointer move only -- it keeps the pin at the tip of the"
+              echo "grammar repository without publishing a release that contains no change."
+            fi
           } > "$body"
 
           # Captured rather than piped into `grep -q`, which can close the pipe
           # under `set -o pipefail` and fail the step on a successful lookup.
           existing=$(gh pr list --head "$BRANCH" --state open --json number --jq 'length')
           if [ "$existing" != "0" ]; then
-            gh pr edit "$BRANCH" --title "Pin grammar to ${rev:0:12}" --body-file "$body"
+            gh pr edit "$BRANCH" --title "$title" --body-file "$body"
           else
             gh pr create \
               --head "$BRANCH" \
               --base "$BASE_BRANCH" \
-              --title "Pin grammar to ${rev:0:12}" \
+              --title "$title" \
               --body-file "$body"
           fi
