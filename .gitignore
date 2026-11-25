@@ -4,3 +4,4 @@
 /grammars/
 /language_servers/
 .DS_Store
+.workdir/*
